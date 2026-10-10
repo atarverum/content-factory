@@ -352,9 +352,9 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
     print(token, name)
 PY
       chmod 755 /etc/xray-sub; chmod 644 /etc/xray-sub/*
-      if ! grep -q 'profile-title' /etc/caddy/Caddyfile; then
-        cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.before-sub
-        write_caddyfile "$DOMAIN"
+      cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.before-sub
+      write_caddyfile "$DOMAIN"
+      if ! cmp -s /etc/caddy/Caddyfile /etc/caddy/Caddyfile.before-sub; then
         caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
           || { cp /etc/caddy/Caddyfile.before-sub /etc/caddy/Caddyfile; die "Caddy не принял настройки, вернул как было"; }
         systemctl restart caddy
