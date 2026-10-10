@@ -16,6 +16,7 @@
 #   bash install-vpn.sh auto     подписка для Happ с автопереключением (XHTTP на 443 и 8443)
 #   bash install-vpn.sh hy2      добавить запасной протокол Hysteria2 (UDP 443)
 #   bash install-vpn.sh clash    файл настроек для Clash Verge Rev
+#   bash install-vpn.sh stats    кто сколько накачал, кто онлайн, куда ходили за час
 #   bash install-vpn.sh sni САЙТ сменить сайт маскировки (self — сайт фабрики)
 set -euo pipefail
 
@@ -311,7 +312,8 @@ import json, sys, hashlib
 p, ip, sni, pub, sid, path = sys.argv[1:]
 cfg = json.load(open(p))
 priv = cfg["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"]
-sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}
+# routeOnly выключен: сервер сам узнаёт адрес сайта (DNS в Нидерландах, без утечек).
+sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False}
 for c in cfg["inbounds"][0]["settings"]["clients"]:
     uid, name = c["id"], c.get("email", "VPN")
     token = hashlib.sha256((uid + priv).encode()).hexdigest()[:24]
@@ -377,12 +379,109 @@ PY
         qrencode -t ansiutf8 -m 1 "$URL"
       done < /etc/xray-sub/.list
       exit 0 ;;
+    stats)
+      # Кто сколько накачал и куда ходил. При первом запуске включает в Xray счётчики и журнал сайтов.
+      if ! grep -q '"StatsService"' "$CFG"; then
+        cp "$CFG" "$CFG.before-stats"
+        python3 - "$CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["log"] = {"loglevel": "warning", "access": "/var/log/xray/access.log"}
+cfg["stats"] = {}
+cfg["api"] = {"tag": "api", "services": ["StatsService"]}
+cfg["policy"] = {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True}},
+                 "system": {"statsInboundUplink": True, "statsInboundDownlink": True}}
+cfg["inbounds"] = [i for i in cfg["inbounds"] if i.get("tag") != "api"] + [
+    {"tag": "api", "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door",
+     "settings": {"address": "127.0.0.1"}}]
+r = cfg.setdefault("routing", {}).setdefault("rules", [])
+if not any(x.get("outboundTag") == "api" for x in r):
+    r.insert(0, {"type": "field", "inboundTag": ["api"], "outboundTag": "api"})
+json.dump(cfg, open(p, "w"), indent=2)
+PY
+        mkdir -p /var/log/xray && touch /var/log/xray/access.log && chmod 644 /var/log/xray/access.log
+        id nobody >/dev/null 2>&1 && chown nobody /var/log/xray /var/log/xray/access.log 2>/dev/null || true
+        # Журнал сайтов храним 3 дня, чтобы не копить чужую историю и не забивать диск.
+        cat > /etc/logrotate.d/xray-vpn <<'EOF'
+/var/log/xray/access.log {
+	daily
+	rotate 3
+	missingok
+	notifempty
+	compress
+	copytruncate
+}
+EOF
+        if ! xray run -test -config "$CFG" >/dev/null; then
+          cp "$CFG.before-stats" "$CFG"; die "Xray не принял настройки, вернул как было"
+        fi
+        command -v vnstat >/dev/null || apt-get install -y -qq vnstat >/dev/null 2>&1 || true
+        systemctl enable -q --now vnstat 2>/dev/null || true
+        systemctl restart xray; sleep 2
+        systemctl is-active -q xray || { cp "$CFG.before-stats" "$CFG"; systemctl restart xray; die "VPN не запустился, вернул как было"; }
+        say "Счётчики включены. Данные копятся с этой минуты."
+      fi
+      say "Трафик по людям (с последнего перезапуска VPN)"
+      xray api statsquery --server=127.0.0.1:10085 2>/dev/null | python3 -c '
+import json, sys
+try:
+    stats = json.load(sys.stdin).get("stat", [])
+except Exception:
+    stats = []
+users = {}
+for s in stats:
+    parts = s["name"].split(">>>")
+    if parts[0] == "user" and len(parts) == 4:
+        users.setdefault(parts[1], {})[parts[3]] = int(s.get("value", 0))
+if not users:
+    print("  пока пусто: никто не подключался")
+for name, v in sorted(users.items(), key=lambda kv: -sum(kv[1].values())):
+    down, up = v.get("downlink", 0) / 1e6, v.get("uplink", 0) / 1e6
+    print(f"  {name:<14} скачал {down:9.1f} МБ   отправил {up:8.1f} МБ")
+'
+      say "Сейчас онлайн"
+      for u in $(python3 -c "import json;c=json.load(open('$CFG'));print(' '.join(sorted({x.get('email','') for i in c['inbounds'] if i.get('protocol')=='vless' for x in i['settings']['clients']})))"); do
+        ips=$(xray api statsonlineiplist --server=127.0.0.1:10085 -email "$u" 2>/dev/null | python3 -c 'import json,sys
+try: print(len(json.load(sys.stdin).get("ips", {})))
+except Exception: print(0)')
+        [ "${ips:-0}" -gt 0 ] && echo "  $u: устройств $ips"
+      done
+      say "Куда ходили за последний час (сайт: сколько раз)"
+      python3 - <<'PY'
+import re, collections, datetime
+cut = (datetime.datetime.now() - datetime.timedelta(hours=1)).strftime("%Y/%m/%d %H:%M:%S")
+per = collections.defaultdict(collections.Counter)
+try:
+    lines = open("/var/log/xray/access.log", errors="replace").readlines()
+except OSError:
+    lines = []
+for line in lines:
+    if line[:19] < cut or " accepted " not in line:
+        continue
+    m = re.search(r"accepted (?:tcp|udp):([^:\s]+):\d+.*email: (\S+)", line)
+    if not m:
+        continue
+    host = m.group(1)
+    if not re.fullmatch(r"[\d.]+", host):
+        host = ".".join(host.split(".")[-2:])
+    per[m.group(2)][host] += 1
+if not per:
+    print("  пока пусто")
+for user, c in per.items():
+    print(f"  {user}: " + ", ".join(f"{h} {n}" for h, n in c.most_common(10)))
+PY
+      if command -v vnstat >/dev/null; then
+        say "Весь трафик сервера за месяц (VPN + фабрика)"
+        vnstat -m 2>/dev/null | tail -n 4 || echo "  статистика появится через несколько минут"
+      fi
+      exit 0 ;;
     all)
       bash "$0" sni self >/dev/null
       grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
       [ -f /etc/hysteria/vpn.env ] || bash "$0" hy2 >/dev/null
       exec bash "$0" show ;;
-    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all, auto и clash)" ;;
+    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all, auto, stats и clash)" ;;
   esac
 fi
 
