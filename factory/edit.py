@@ -339,7 +339,7 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
                  for w in words if w["start"] >= seek]
     segments, new_words = plan_cuts(words, duration)
     total = sum(e - s for s, e in segments)
-    end_sec = END_SECONDS if end_card else 0.0
+    end_sec = END_SECONDS if end_card and st.get("end_card", True) else 0.0
 
     if not cards:
         cards = []

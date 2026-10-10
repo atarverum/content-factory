@@ -50,6 +50,7 @@ STYLES = {
 # мягкий тёплый цвет; речь ускорена в 1,1 раза; зумы по смыслу, а не через склейку.
 STYLES["polina"] = {
     "title": "Как у Полины",
+    "end_card": False,  # Полина не ставит финальную заставку
     "font": "Jost",
     "font_size": 124,
     "uppercase": False,
@@ -80,7 +81,7 @@ ACCENT_COLORS = {"red": LIPSTICK, "gold": GOLD, "indigo": INDIGO, "green": FORES
 # Слова, которые выделяются сами (начало слова, без учёта регистра).
 ACCENT_AUTO = ["новолун", "полнолун", "затмени", "календар", "расклад", "одина"]
 
-END_CARD = "Лунные сутки каждое утро\\Nссылка в профиле"
+END_CARD = "Больше в Telegram\\Nссылка в профиле"
 
 
 def ass_color(hex_rgb: str, alpha: int = 0) -> str:
