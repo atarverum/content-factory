@@ -285,8 +285,8 @@ EOF
       echo "Скачайте его на Mac командой (на Mac): scp root@$IP:$OUT ~/Downloads/"
       exit 0 ;;
     auto)
-      # Подписка для Happ с автопереключением: два входа XHTTP (порты 443 и 8443). Happ раз в минуту
-      # проверяет (раз в 30 секунд), через какой реально открываются сайты, и идёт через лучший. Русские сайты идут напрямую.
+      # Подписка для Happ с автопереключением: два входа XHTTP (порты 443 и 8443). Happ
+      # проверяет (раз в 30 секунд), жив ли основной вход 8443, и если нет, идёт через 443. Русские сайты идут напрямую.
       [ "$PORT" = 443 ] || die "сначала: bash install-vpn.sh move443"
       grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
       # shellcheck disable=SC1090
@@ -338,14 +338,17 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
         "observatory": {"subjectSelector": ["vpn-"], "probeURL": "https://www.google.com/generate_204",
                         "probeInterval": "30s", "enableConcurrency": True},
         "routing": {"domainStrategy": "IPIfNonMatch",
-            "balancers": [{"tag": "auto", "selector": ["vpn-"], "strategy": {"type": "leastPing"},
-                           "fallbackTag": "vpn-8443"}],
+            # Основной вход 8443 (проверен у Александра), 443 включается, только если 8443 не ответил на проверку.
+            "balancers": [{"tag": "auto", "selector": ["vpn-8443"], "strategy": {"type": "leastPing"},
+                           "fallbackTag": "vpn-443"}],
             "rules": [
                 {"type": "field", "ip": ["geoip:private", ip], "outboundTag": "direct"},
                 {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
                 {"type": "field", "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"],
                  "outboundTag": "direct"},
                 {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"},
+                # QUIC (HTTP/3) через туннель тормозит: браузер сразу уходит на обычный HTTPS.
+                {"type": "field", "network": "udp", "port": "443", "outboundTag": "block"},
                 {"type": "field", "network": "tcp,udp", "balancerTag": "auto"}]}}
     with open("/etc/xray-sub/" + token, "w") as f:
         json.dump(conf, f, ensure_ascii=False, indent=2)
