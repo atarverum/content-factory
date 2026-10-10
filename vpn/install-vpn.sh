@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # Личный VPN на этом сервере: Xray VLESS + Reality (маскируется под обычный https-сайт,
-# поэтому его плохо видят российские блокировки). Порт 443 занят Caddy контент-фабрики,
-# поэтому VPN слушает 8443 и Caddy/бота не трогает.
+# поэтому его плохо видят российские блокировки).
+#
+# VPN стоит на порту 443: нестандартные порты российские провайдеры режут. Сайт контент-фабрики
+# при этом работает как раньше: всех, кто пришёл без ключа VPN, Xray незаметно передаёт в Caddy,
+# который теперь слушает только 127.0.0.1:8444 (Reality «маскируется под самого себя»).
 #
 # Запуск (на сервере, от root):
 #   bash install-vpn.sh          поставить (или, если уже стоит, показать ключ)
 #   bash install-vpn.sh show     показать ключ и QR-код ещё раз
 #   bash install-vpn.sh add Имя  выдать отдельный ключ ещё одному человеку
+#   bash install-vpn.sh move443  перенести старую установку с порта 8443 на 443
 set -euo pipefail
 
-PORT="${VPN_PORT:-8443}"
-SNI="${VPN_SNI:-www.microsoft.com}"
+CADDY_PORT=8444
 DIR=/usr/local/etc/xray
 CFG=$DIR/config.json
 STATE=$DIR/vpn.env
@@ -33,6 +36,72 @@ print_key() {  # $1 = uuid, $2 = подпись
   echo
   qrencode -t ansiutf8 -m 1 "$link"
   echo "Этот QR-код можно отсканировать приложением на iPhone."
+}
+
+# Caddyfile, при котором 443 отдан VPN, а сайт живёт за ним на 127.0.0.1:$CADDY_PORT.
+write_caddyfile() {  # $1 = домен
+  cat > /etc/caddy/Caddyfile <<EOF
+# Порт 443 занят VPN (Xray). Посетителей сайта Xray передаёт сюда, на 127.0.0.1:$CADDY_PORT.
+{
+	https_port $CADDY_PORT
+	auto_https disable_redirects
+}
+http://$1 {
+	redir https://$1{uri} permanent
+}
+$1:$CADDY_PORT {
+	bind 127.0.0.1
+	reverse_proxy 127.0.0.1:8080
+}
+EOF
+}
+
+# Переводит VPN на 443, а Caddy прячет за ним. Если сайт после этого не открывается,
+# всё возвращается как было.
+move_to_443() {
+  # shellcheck disable=SC1090
+  . "$STATE"
+  local domain="${IP//./-}.sslip.io" code
+  say "Переношу VPN на порт 443 (сайт $domain продолжит работать)"
+  cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.before-vpn
+  cp "$CFG" "$CFG.before-443"
+  cp "$STATE" "$STATE.before-443"
+
+  write_caddyfile "$domain"
+  python3 - "$CFG" "$domain" "$CADDY_PORT" <<'PY'
+import json, sys
+p, domain, cport = sys.argv[1:]
+cfg = json.load(open(p))
+ib = cfg["inbounds"][0]
+ib["port"] = 443
+r = ib["streamSettings"]["realitySettings"]
+r["dest"] = "127.0.0.1:" + cport
+r["serverNames"] = [domain]
+json.dump(cfg, open(p, "w"), indent=2)
+PY
+  sed -i -e 's/^PORT=.*/PORT=443/' -e "s/^SNI=.*/SNI=$domain/" "$STATE"
+
+  code=000
+  if xray run -test -config "$CFG" >/dev/null && caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+    systemctl restart caddy; sleep 1
+    systemctl restart xray; sleep 3
+    # Любой ответ сайта (даже 404) значит, что цепочка «Xray → Caddy» и сертификат в порядке.
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$domain/" || true)
+  fi
+  if [ "$code" != 000 ] && systemctl is-active -q xray && systemctl is-active -q caddy; then
+    if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then ufw allow 443/tcp >/dev/null; fi
+    return 0
+  fi
+
+  echo "Что-то пошло не так, возвращаю как было. Журнал:"
+  journalctl -u xray -u caddy -n 20 --no-pager || true
+  cp /etc/caddy/Caddyfile.before-vpn /etc/caddy/Caddyfile
+  cp "$CFG.before-443" "$CFG"
+  cp "$STATE.before-443" "$STATE"
+  systemctl stop xray || true
+  systemctl restart caddy || true
+  systemctl start xray || true
+  die "перенос на 443 не удался, всё вернул как было. Пришлите скриншот этого окна."
 }
 
 if [ -f "$STATE" ]; then
@@ -60,9 +129,16 @@ PY
       systemctl restart xray
       print_key "$NEW" "$NAME"
       exit 0 ;;
-    *) die "неизвестная команда: $1 (есть show и add)" ;;
+    move443)
+      if [ "$PORT" = 443 ]; then echo "VPN уже на порту 443."; exit 0; fi
+      move_to_443
+      say "Готово. Старые ключи больше не работают, вот новые:"
+      exec bash "$0" show ;;
+    *) die "неизвестная команда: $1 (есть show, add и move443)" ;;
   esac
 fi
+
+command -v caddy >/dev/null && [ -f /etc/caddy/Caddyfile ] || die "не найден Caddy: сначала поставьте контент-фабрику (install.sh)"
 
 say "Ставлю нужные программы"
 export DEBIAN_FRONTEND=noninteractive
@@ -72,10 +148,6 @@ apt-get install -y -qq curl unzip qrencode python3 >/dev/null
 say "Ставлю Xray (официальный установщик)"
 bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null
 command -v xray >/dev/null || die "Xray не установился"
-
-if ss -ltn "sport = :$PORT" | grep -q LISTEN; then
-  die "порт $PORT уже занят другой программой. Запустите так: VPN_PORT=9443 bash install-vpn.sh"
-fi
 
 say "Создаю ключи"
 UUID=$(xray uuid)
@@ -87,6 +159,7 @@ PUB=$(echo "$KEYS" | awk -F': *' 'tolower($1) ~ /public|password/ {print $2; exi
 SID=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
 IP=$(server_ip)
 
+# Порт, адрес маскировки и имя сервера заполнит move_to_443.
 mkdir -p "$DIR"
 cat > "$CFG" <<EOF
 {
@@ -94,7 +167,7 @@ cat > "$CFG" <<EOF
   "inbounds": [
     {
       "listen": "0.0.0.0",
-      "port": $PORT,
+      "port": 8443,
       "protocol": "vless",
       "settings": {
         "clients": [ { "id": "$UUID", "flow": "xtls-rprx-vision", "email": "Alexander" } ],
@@ -104,8 +177,8 @@ cat > "$CFG" <<EOF
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-          "dest": "$SNI:443",
-          "serverNames": [ "$SNI" ],
+          "dest": "127.0.0.1:$CADDY_PORT",
+          "serverNames": [ "localhost" ],
           "privateKey": "$PRIV",
           "shortIds": [ "$SID" ]
         }
@@ -125,16 +198,14 @@ EOF
 chmod 644 "$CFG"
 # Если дальше что-то сломается, не оставляем полуготовую установку: повторный запуск начнёт заново.
 trap 'rm -f "$STATE"' EXIT
-umask 077
-cat > "$STATE" <<EOF
+(umask 077; cat > "$STATE" <<EOF
 IP=$IP
-PORT=$PORT
-SNI=$SNI
+PORT=8443
+SNI=localhost
 PUB=$PUB
 SID=$SID
 EOF
-
-xray run -test -config "$CFG" >/dev/null || die "Xray не принял настройки"
+)
 
 say "Включаю ускорение сети (BBR)"
 cat > /etc/sysctl.d/99-vpn-speed.conf <<EOF
@@ -143,17 +214,8 @@ net.ipv4.tcp_congestion_control=bbr
 EOF
 sysctl -q --system || true
 
-if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-  say "Открываю порт $PORT в файрволе"
-  ufw allow "$PORT/tcp" >/dev/null
-fi
-
-say "Запускаю VPN"
 systemctl enable -q xray
-systemctl restart xray
-sleep 2
-systemctl is-active -q xray || { journalctl -u xray -n 20 --no-pager; die "VPN не запустился"; }
-
+move_to_443
 trap - EXIT
 print_key "$UUID" "Alexander"
-say "Готово. Сайт и бот контент-фабрики не тронуты (они на порту 443)."
+say "Готово. Сайт и бот контент-фабрики работают как раньше."

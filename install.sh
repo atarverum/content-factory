@@ -103,11 +103,28 @@ say "Скачиваю модель распознавания речи (один
 "$APP/.venv/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
 
 say "Настраиваю https-адрес $(getenv PUBLIC_URL)"
-cat > /etc/caddy/Caddyfile <<EOF
+if grep -qs '^PORT=443$' /usr/local/etc/xray/vpn.env; then
+  # Порт 443 занят личным VPN (vpn/install-vpn.sh): сайт живёт за ним на 127.0.0.1:8444.
+  cat > /etc/caddy/Caddyfile <<EOF
+{
+	https_port 8444
+	auto_https disable_redirects
+}
+http://${IP//./-}.sslip.io {
+	redir https://${IP//./-}.sslip.io{uri} permanent
+}
+${IP//./-}.sslip.io:8444 {
+	bind 127.0.0.1
+	reverse_proxy 127.0.0.1:8080
+}
+EOF
+else
+  cat > /etc/caddy/Caddyfile <<EOF
 ${IP//./-}.sslip.io {
 	reverse_proxy 127.0.0.1:8080
 }
 EOF
+fi
 systemctl reload caddy || systemctl restart caddy
 
 say "Запускаю бота как службу"
