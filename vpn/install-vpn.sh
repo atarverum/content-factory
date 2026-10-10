@@ -11,6 +11,11 @@
 #   bash install-vpn.sh show     показать ключ и QR-код ещё раз
 #   bash install-vpn.sh add Имя  выдать отдельный ключ ещё одному человеку
 #   bash install-vpn.sh move443  перенести старую установку с порта 8443 на 443
+#   bash install-vpn.sh xhttp    добавить второй вход VLESS через XHTTP на порту 8443
+#   bash install-vpn.sh all      поставить всё сразу (XHTTP + Hysteria2) и показать все ключи
+#   bash install-vpn.sh hy2      добавить запасной протокол Hysteria2 (UDP 443)
+#   bash install-vpn.sh clash    файл настроек для Clash Verge Rev
+#   bash install-vpn.sh sni САЙТ сменить сайт маскировки (self — сайт фабрики)
 set -euo pipefail
 
 CADDY_PORT=8444
@@ -31,7 +36,10 @@ print_key() {  # $1 = uuid, $2 = подпись
   # shellcheck disable=SC1090
   . "$STATE"
   local link="vless://$1@$IP:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=tcp#$2"
-  say "Ключ «$2» (скопируйте целиком одной строкой)"
+  if [ "${3:-}" = xhttp ]; then
+    link="vless://$1@$IP:8443?encryption=none&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=xhttp&path=%2F$XPATH&mode=auto#$2-XHTTP"
+  fi
+  say "Ключ «$2${3:+ (XHTTP)}» (скопируйте целиком одной строкой)"
   echo "$link"
   echo
   qrencode -t ansiutf8 -m 1 "$link"
@@ -109,11 +117,14 @@ if [ -f "$STATE" ]; then
   . "$STATE"
   case "${1:-show}" in
     show)
-      python3 - "$CFG" <<'PY' | while read -r id name; do print_key "$id" "$name"; done
+      python3 - "$CFG" <<'PY' | while read -r id name kind; do print_key "$id" "$name" "$kind"; done
 import json, sys
-for c in json.load(open(sys.argv[1]))["inbounds"][0]["settings"]["clients"]:
-    print(c["id"], c.get("email", "VPN"))
+for ib in json.load(open(sys.argv[1]))["inbounds"]:
+    kind = "xhttp" if ib.get("tag") == "xhttp" else ""
+    for c in ib["settings"]["clients"]:
+        print(c["id"], c.get("email", "VPN"), kind)
 PY
+      if [ -f /etc/hysteria/vpn.env ]; then exec bash "$0" hy2; fi
       exit 0 ;;
     add)
       NAME="${2:-}"; [ -n "$NAME" ] || die "укажите имя: bash install-vpn.sh add Полина"
@@ -123,7 +134,9 @@ PY
 import json, sys
 p, uid, name = sys.argv[1:]
 cfg = json.load(open(p))
-cfg["inbounds"][0]["settings"]["clients"].append({"id": uid, "flow": "xtls-rprx-vision", "email": name})
+for ib in cfg["inbounds"]:
+    flow = "" if ib.get("tag") == "xhttp" else "xtls-rprx-vision"
+    ib["settings"]["clients"].append({"id": uid, "flow": flow, "email": name})
 json.dump(cfg, open(p, "w"), indent=2)
 PY
       systemctl restart xray
@@ -161,6 +174,31 @@ PY
       echo "В Happ откройте сервер и в поле «Имя сервера» впишите: $TARGET"
       [ "$TARGET" = "$DOMAIN" ] || echo "Сайт фабрики сейчас не открывается. Вернуть: bash install-vpn.sh sni self"
       exit 0 ;;
+    xhttp)
+      # Второй вход VLESS: XHTTP + Reality на TCP 8443 (те же ключи и маскировка, что у основного на 443).
+      # Российские фильтры такую связку ловят хуже, чем «tcp + Vision».
+      XPATH="${XPATH:-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+      python3 - "$CFG" "$XPATH" <<'PY'
+import json, sys, copy
+p, path = sys.argv[1:]
+cfg = json.load(open(p))
+cfg["inbounds"] = [ib for ib in cfg["inbounds"] if ib.get("tag") != "xhttp"]
+main = cfg["inbounds"][0]
+ib = copy.deepcopy(main)
+ib["tag"] = "xhttp"
+ib["port"] = 8443
+ib["streamSettings"]["network"] = "xhttp"
+ib["streamSettings"]["xhttpSettings"] = {"path": "/" + path, "mode": "auto"}
+for c in ib["settings"]["clients"]:
+    c["flow"] = ""
+cfg["inbounds"].append(ib)
+json.dump(cfg, open(p, "w"), indent=2)
+PY
+      sed -i '/^XPATH=/d' "$STATE"; echo "XPATH=$XPATH" >> "$STATE"
+      xray run -test -config "$CFG" >/dev/null || die "Xray не принял настройки"
+      if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then ufw allow 8443/tcp >/dev/null; fi
+      systemctl restart xray
+      exec bash "$0" show ;;
     hy2)
       # Второй, запасной протокол: Hysteria2 по UDP 443. TCP 443 у Xray, UDP 443 свободен
       # (Caddy слушает только 127.0.0.1:8444). Сертификат самоподписанный, клиент сверяет его отпечаток.
@@ -231,7 +269,12 @@ EOF
       say "Файл для Clash Verge Rev готов: $OUT"
       echo "Скачайте его на Mac командой (на Mac): scp root@$IP:$OUT ~/Downloads/"
       exit 0 ;;
-    *) die "неизвестная команда: $1 (есть show, add, move443, sni, hy2 и clash)" ;;
+    all)
+      bash "$0" sni self >/dev/null
+      grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
+      [ -f /etc/hysteria/vpn.env ] || bash "$0" hy2 >/dev/null
+      exec bash "$0" show ;;
+    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all и clash)" ;;
   esac
 fi
 
