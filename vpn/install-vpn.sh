@@ -161,7 +161,50 @@ PY
       echo "В Happ откройте сервер и в поле «Имя сервера» впишите: $TARGET"
       [ "$TARGET" = "$DOMAIN" ] || echo "Сайт фабрики сейчас не открывается. Вернуть: bash install-vpn.sh sni self"
       exit 0 ;;
-    *) die "неизвестная команда: $1 (есть show, add, move443 и sni)" ;;
+    hy2)
+      # Второй, запасной протокол: Hysteria2 по UDP 443. TCP 443 у Xray, UDP 443 свободен
+      # (Caddy слушает только 127.0.0.1:8444). Сертификат самоподписанный, клиент сверяет его отпечаток.
+      HY=/etc/hysteria
+      if [ ! -f "$HY/vpn.env" ]; then
+        say "Ставлю Hysteria2 (официальный установщик)"
+        bash <(curl -fsSL https://get.hy2.sh/) >/dev/null
+        command -v hysteria >/dev/null || die "Hysteria2 не установилась"
+        mkdir -p "$HY"
+        openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 \
+          -keyout "$HY/key.pem" -out "$HY/cert.pem" -subj "/CN=${IP//./-}.sslip.io" 2>/dev/null
+        chown hysteria "$HY/key.pem" "$HY/cert.pem" 2>/dev/null || chmod 644 "$HY/key.pem"
+        HYPASS=$(head -c 18 /dev/urandom | base64 | tr -d '/+=')
+        cat > "$HY/config.yaml" <<EOF
+listen: :443
+tls:
+  cert: $HY/cert.pem
+  key: $HY/key.pem
+auth:
+  type: password
+  password: $HYPASS
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${IP//./-}.sslip.io/
+    rewriteHost: true
+EOF
+        PIN=$(openssl x509 -in "$HY/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+        (umask 077; printf 'HYPASS=%s\nPIN=%s\n' "$HYPASS" "$PIN" > "$HY/vpn.env")
+        if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then ufw allow 443/udp >/dev/null; fi
+        systemctl enable -q hysteria-server
+        systemctl restart hysteria-server
+        sleep 2
+        systemctl is-active -q hysteria-server || { journalctl -u hysteria-server -n 20 --no-pager; die "Hysteria2 не запустилась"; }
+      fi
+      # shellcheck disable=SC1090
+      . "$HY/vpn.env"
+      LINK="hysteria2://$HYPASS@$IP:443/?sni=${IP//./-}.sslip.io&insecure=1&pinSHA256=$PIN#Alexander-Hysteria2"
+      say "Ключ Hysteria2 (скопируйте целиком одной строкой)"
+      echo "$LINK"
+      echo
+      qrencode -t ansiutf8 -m 1 "$LINK"
+      exit 0 ;;
+    *) die "неизвестная команда: $1 (есть show, add, move443, sni и hy2)" ;;
   esac
 fi
 
