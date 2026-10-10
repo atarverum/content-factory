@@ -469,6 +469,7 @@ async def _send_preview(chat_id: int, job_id: str):
     f = _job_files(job_id)
     video, full_link = f["out"], ""
     if not LOCAL_API and os.path.getsize(f["out"]) > TG_SEND_LIMIT:
+        await bot.send_message(chat_id, "Ролик больше 50 МБ, делаю облегчённую копию для Telegram, это пара минут…")
         video = await asyncio.to_thread(_small_copy, f["out"], os.path.join(f["dir"], "preview.mp4"),
                                         float(j.get("duration") or 60))
         if PUBLIC_URL:
