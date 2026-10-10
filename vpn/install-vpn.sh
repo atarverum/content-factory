@@ -340,7 +340,7 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
             "balancers": [{"tag": "auto", "selector": ["vpn-"], "strategy": {"type": "leastPing"},
                            "fallbackTag": "vpn-8443"}],
             "rules": [
-                {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+                {"type": "field", "ip": ["geoip:private", ip], "outboundTag": "direct"},
                 {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
                 {"type": "field", "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"],
                  "outboundTag": "direct"},
