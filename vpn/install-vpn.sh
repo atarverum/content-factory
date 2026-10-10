@@ -141,6 +141,7 @@ json.dump(cfg, open(p, "w"), indent=2)
 PY
       systemctl restart xray
       print_key "$NEW" "$NAME"
+      if grep -q '"tag": "xhttp"' "$CFG"; then print_key "$NEW" "$NAME" xhttp; fi
       exit 0 ;;
     move443)
       if [ "$PORT" = 443 ]; then echo "VPN уже на порту 443."; exit 0; fi
