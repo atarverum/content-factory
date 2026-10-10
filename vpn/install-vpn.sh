@@ -337,16 +337,20 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
                       {"tag": "block", "protocol": "blackhole"}],
         "observatory": {"subjectSelector": ["vpn-"], "probeURL": "https://www.google.com/generate_204",
                         "probeInterval": "30s", "enableConcurrency": True},
-        "routing": {"domainStrategy": "IPIfNonMatch",
+        # Без geoip/geosite: на iPhone у VPN всего 50 МБ памяти, а эти базы съедают ~20 МБ и тормозят запуск.
+        "routing": {"domainStrategy": "AsIs",
             # Основной вход 8443 (проверен у Александра), 443 включается, только если 8443 не ответил на проверку.
             "balancers": [{"tag": "auto", "selector": ["vpn-8443"], "strategy": {"type": "leastPing"},
                            "fallbackTag": "vpn-443"}],
             "rules": [
-                {"type": "field", "ip": ["geoip:private", ip], "outboundTag": "direct"},
-                {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
-                {"type": "field", "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"],
+                {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+                                         "169.254.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10", ip],
                  "outboundTag": "direct"},
-                {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"},
+                {"type": "field", "domain": ["domain:ru", "domain:su", "domain:xn--p1ai", "domain:moscow",
+                    "domain:yandex.net", "domain:yandex.com", "domain:yastatic.net", "domain:ya.ru",
+                    "domain:vk.com", "domain:vk.me", "domain:userapi.com", "domain:vkuser.net", "domain:mycdn.me",
+                    "domain:okcdn.ru", "domain:max.ru", "domain:wbbasket.ru", "domain:avito.st"],
+                 "outboundTag": "direct"},
                 # QUIC (HTTP/3) через туннель тормозит: браузер сразу уходит на обычный HTTPS.
                 {"type": "field", "network": "udp", "port": "443", "outboundTag": "block"},
                 {"type": "field", "network": "tcp,udp", "balancerTag": "auto"}]}}
