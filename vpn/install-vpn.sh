@@ -204,7 +204,34 @@ EOF
       echo
       qrencode -t ansiutf8 -m 1 "$LINK"
       exit 0 ;;
-    *) die "неизвестная команда: $1 (есть show, add, move443, sni и hy2)" ;;
+    clash)
+      # Файл настроек для Clash Verge Rev (ядро mihomo): VLESS + Reality и, если стоит, Hysteria2.
+      OUT=/root/clash-vpn.yaml
+      UUID=$(python3 -c "import json;print(json.load(open('$CFG'))['inbounds'][0]['settings']['clients'][0]['id'])")
+      {
+        echo "mixed-port: 7890"
+        echo "allow-lan: false"
+        echo "mode: rule"
+        echo "log-level: warning"
+        echo "proxies:"
+        echo "  - {name: VLESS, type: vless, server: $IP, port: $PORT, uuid: $UUID, network: tcp, tls: true, udp: true, flow: xtls-rprx-vision, servername: $SNI, client-fingerprint: chrome, reality-opts: {public-key: $PUB, short-id: $SID}}"
+        HYNAME=""
+        if [ -f /etc/hysteria/vpn.env ]; then
+          # shellcheck disable=SC1091
+          . /etc/hysteria/vpn.env
+          echo "  - {name: Hysteria2, type: hysteria2, server: $IP, port: 443, password: $HYPASS, sni: ${IP//./-}.sslip.io, skip-cert-verify: true}"
+          HYNAME=", Hysteria2"
+        fi
+        echo "proxy-groups:"
+        echo "  - {name: VPN, type: select, proxies: [VLESS$HYNAME]}"
+        echo "rules:"
+        echo "  - MATCH,VPN"
+      } > "$OUT"
+      chmod 600 "$OUT"
+      say "Файл для Clash Verge Rev готов: $OUT"
+      echo "Скачайте его на Mac командой (на Mac): scp root@$IP:$OUT ~/Downloads/"
+      exit 0 ;;
+    *) die "неизвестная команда: $1 (есть show, add, move443, sni, hy2 и clash)" ;;
   esac
 fi
 
