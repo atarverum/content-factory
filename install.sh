@@ -116,6 +116,9 @@ http://${IP//./-}.sslip.io {
 ${IP//./-}.sslip.io:8444 {
 	bind 127.0.0.1
 	handle_path /sub/* {
+		# Happ сам обновляет подписку раз в час.
+		header Content-Type "application/json; charset=utf-8"
+		header profile-update-interval "1"
 		root * /etc/xray-sub
 		file_server
 	}

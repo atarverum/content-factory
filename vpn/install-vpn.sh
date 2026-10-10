@@ -63,6 +63,9 @@ $1:$CADDY_PORT {
 	bind 127.0.0.1
 	# Подписки VPN для Happ (файлы с секретными именами, см. команду auto).
 	handle_path /sub/* {
+		# Happ сам обновляет подписку раз в час.
+		header Content-Type "application/json; charset=utf-8"
+		header profile-update-interval "1"
 		root * /etc/xray-sub
 		file_server
 	}
@@ -282,7 +285,7 @@ EOF
       exit 0 ;;
     auto)
       # Подписка для Happ с автопереключением: два входа XHTTP (порты 443 и 8443). Happ раз в минуту
-      # проверяет, через какой реально открываются сайты, и идёт через лучший. Русские сайты идут напрямую.
+      # проверяет (раз в 30 секунд), через какой реально открываются сайты, и идёт через лучший. Русские сайты идут напрямую.
       [ "$PORT" = 443 ] || die "сначала: bash install-vpn.sh move443"
       grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
       # shellcheck disable=SC1090
@@ -332,12 +335,13 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
                       {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
                       {"tag": "block", "protocol": "blackhole"}],
         "observatory": {"subjectSelector": ["vpn-"], "probeURL": "https://www.google.com/generate_204",
-                        "probeInterval": "1m", "enableConcurrency": True},
+                        "probeInterval": "30s", "enableConcurrency": True},
         "routing": {"domainStrategy": "IPIfNonMatch",
             "balancers": [{"tag": "auto", "selector": ["vpn-"], "strategy": {"type": "leastPing"},
                            "fallbackTag": "vpn-8443"}],
             "rules": [
                 {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+                {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
                 {"type": "field", "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"],
                  "outboundTag": "direct"},
                 {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"},
@@ -347,7 +351,7 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
     print(token, name)
 PY
       chmod 755 /etc/xray-sub; chmod 644 /etc/xray-sub/*
-      if ! grep -q 'handle_path /sub/' /etc/caddy/Caddyfile; then
+      if ! grep -q 'profile-update-interval' /etc/caddy/Caddyfile; then
         cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.before-sub
         write_caddyfile "$DOMAIN"
         caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
