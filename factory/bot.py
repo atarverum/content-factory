@@ -105,6 +105,7 @@ HELP = (
     "В рассказах и скетчах Claude читает расшифровку как сценарий: убирает дубли, оговорки и вводные, "
     "ставит наезды и картинки, а перед отправкой сам проверяет кадры. Вернуть вырезанное: «оставь кусок про …», "
     "всё заново: «смонтируй заново». Если одну правку просите в разных роликах, я предложу её запомнить.\n\n"
+    "Видео больше 20 МБ: /upload даст ссылку, по которой его можно загрузить прямо на сервер.\n\n"
     "/edits все виды правок\n/forget забыть запомненные настройки\n/plan очередь публикаций\n/stats статистика Instagram\n/style стиль по умолчанию: как у Полины, ночной или светлый\n"
     "/pause и /resume остановить или возобновить публикации\n/instagram подключить Instagram\n"
     "/invite код для второго человека"
@@ -482,20 +483,14 @@ async def _process(chat_id: int, job_id: str, new_caption: bool, hint: str | Non
             pass
 
 
-@dp.message(F.video | F.video_note | (F.document & F.document.mime_type.startswith("video/")))
-async def on_video(m: Message):
-    if not _allowed(m.from_user.id):
-        return
-    media = m.video or m.video_note or m.document
-    if media.file_size and media.file_size > 20 * 1024 * 1024 and not LOCAL_API:
-        await m.answer("Видео больше 20 МБ, а Telegram не отдаёт ботам такие файлы без локального сервера. "
-                       "Пока сожмите видео или пришлите покороче; локальный сервер включается в установщике.")
-        return
-    job_id = dt.datetime.now(MSK).strftime("%m%d-%H%M") + "-" + uuid.uuid4().hex[:4]
-    f = _job_files(job_id)
-    await bot.download(media, destination=f["src"])
-    badge, hint = _parse_hint(m.caption)
-    job = {"id": job_id, "chat_id": m.chat.id, "status": "processing", "style": store.load()["style"],
+def _new_job_id() -> str:
+    return dt.datetime.now(MSK).strftime("%m%d-%H%M") + "-" + uuid.uuid4().hex[:4]
+
+
+async def _start_job(chat_id: int, job_id: str, caption: str | None):
+    """Исходник уже лежит в папке ролика: заводим задание, спрашиваем жанр или сразу монтируем."""
+    badge, hint = _parse_hint(caption)
+    job = {"id": job_id, "chat_id": chat_id, "status": "processing", "style": store.load()["style"],
            "badge": badge, "music": bool(_music_file(True)), "removed": [], "key": secrets.token_urlsafe(12),
            "created": time.time()}
     if "music" in (store.load().get("defaults") or {}):  # автор попросил запомнить «без музыки» / «с музыкой»
@@ -508,9 +503,53 @@ async def on_video(m: Message):
         job["status"] = "waiting"
     store.update(lambda d: d["jobs"].__setitem__(job_id, job))
     if not genre:
-        await m.answer(GENRE_QUESTION, reply_markup=_genre_kb(job_id))
+        await bot.send_message(chat_id, GENRE_QUESTION, reply_markup=_genre_kb(job_id))
         return
-    await _process(m.chat.id, job_id, new_caption=True, hint=hint)
+    await _process(chat_id, job_id, new_caption=True, hint=hint)
+
+
+def _upload_link(chat_id: int) -> str | None:
+    """Ссылка для загрузки большого видео прямо на сервер (работает сутки)."""
+    if not PUBLIC_URL:
+        return None
+    token = secrets.token_urlsafe(16)
+
+    def put(d):
+        ups = d.setdefault("uploads", {})
+        for t in [t for t, u in ups.items() if time.time() - u["created"] > 86400]:
+            ups.pop(t)
+        ups[token] = {"chat": chat_id, "created": time.time()}
+    store.update(put)
+    return f"{PUBLIC_URL}/up/{token}"
+
+
+@dp.message(Command("upload"))
+async def cmd_upload(m: Message):
+    if not _allowed(m.from_user.id):
+        return
+    link = _upload_link(m.chat.id)
+    if not link:
+        await m.answer("Адрес сервера не настроен: запустите установку ещё раз.")
+        return
+    await m.answer(f"Загрузите видео по ссылке (без ограничения размера, ссылка работает сутки):\n{link}")
+
+
+@dp.message(F.video | F.video_note | (F.document & F.document.mime_type.startswith("video/")))
+async def on_video(m: Message):
+    if not _allowed(m.from_user.id):
+        return
+    media = m.video or m.video_note or m.document
+    if media.file_size and media.file_size > 20 * 1024 * 1024 and not LOCAL_API:
+        link = _upload_link(m.chat.id)
+        await m.answer(f"Видео {media.file_size / 1048576:.0f} МБ, а Telegram отдаёт ботам файлы только до 20 МБ. "
+                       + (f"Загрузите его по этой ссылке, там ограничения нет:\n{link}\n\n"
+                          "Или пришлите видео сюда со сжатием (не файлом)." if link else
+                          "Пришлите его со сжатием (не файлом) или покороче."))
+        return
+    job_id = _new_job_id()
+    f = _job_files(job_id)
+    await bot.download(media, destination=f["src"])
+    await _start_job(m.chat.id, job_id, m.caption)
 
 
 # ───────────────────────── кнопки ─────────────────────────
@@ -925,6 +964,70 @@ async def web_media(req: web.Request):
     return web.FileResponse(os.path.join(_job_files(job_id)["dir"], name))
 
 
+UPLOAD_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Видео для фабрики</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;background:#15122A;color:#F3EDE3;margin:0;padding:24px;max-width:520px}
+h1{font-size:22px;font-weight:600}label{display:block;margin:18px 0 6px}input,textarea,button{width:100%;box-sizing:border-box;
+font-size:17px;border-radius:10px;border:1px solid #CFA85F;padding:12px;background:#221d3d;color:#F3EDE3}
+button{background:#CFA85F;color:#15122A;font-weight:600;margin-top:20px}button:disabled{opacity:.5}
+#bar{height:10px;background:#221d3d;border-radius:5px;margin-top:18px;overflow:hidden}#fill{height:100%;width:0;background:#CFA85F}
+#msg{margin-top:12px;min-height:24px}</style></head><body>
+<h1>Видео для фабрики</h1>
+<label>Видео</label><input type="file" id="file" accept="video/*">
+<label>Пожелания (необязательно): жанр, «плашка: …», что важно</label><textarea id="cap" rows="3"></textarea>
+<button id="go">Отправить</button><div id="bar"><div id="fill"></div></div><div id="msg"></div>
+<script>
+const go=document.getElementById('go'),msg=document.getElementById('msg'),fill=document.getElementById('fill');
+go.onclick=()=>{const f=document.getElementById('file').files[0];if(!f){msg.textContent='Выберите видео';return}
+const fd=new FormData();fd.append('caption',document.getElementById('cap').value);fd.append('file',f);
+const x=new XMLHttpRequest();x.open('POST',location.href);go.disabled=true;
+x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);fill.style.width=p+'%';
+msg.textContent='Загружаю… '+p+'%'}};
+x.onload=()=>{msg.textContent=x.status==200?'Готово! Возвращайтесь в Telegram, бот уже взялся за ролик.':'Не получилось: '+x.responseText;
+go.disabled=x.status==200};x.onerror=()=>{msg.textContent='Связь прервалась, попробуйте ещё раз';go.disabled=false};x.send(fd)};
+</script></body></html>"""
+
+
+def _upload_token(req: web.Request) -> dict | None:
+    u = (store.load().get("uploads") or {}).get(req.match_info["token"])
+    if not u or time.time() - u["created"] > 86400:
+        return None
+    return u
+
+
+async def web_upload_page(req: web.Request):
+    if not _upload_token(req):
+        return web.Response(text="Ссылка устарела. Попросите новую в боте: /upload", content_type="text/plain", charset="utf-8")
+    return web.Response(text=UPLOAD_PAGE, content_type="text/html", charset="utf-8")
+
+
+async def web_upload(req: web.Request):
+    """Приём большого видео по ссылке из бота: файл пишется на диск кусками, потом обычный монтаж."""
+    u = _upload_token(req)
+    if not u:
+        return web.Response(status=403, text="Ссылка устарела. Попросите новую в боте: /upload")
+    job_id = _new_job_id()
+    f = _job_files(job_id)
+    caption, size = None, 0
+    reader = await req.multipart()
+    async for part in reader:
+        if part.name == "caption":
+            caption = (await part.text()).strip() or None
+        elif part.name == "file":
+            with open(f["src"], "wb") as out:
+                while True:
+                    chunk = await part.read_chunk(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    size += len(chunk)
+    if size < 1000:
+        return web.Response(status=400, text="Файл не дошёл, попробуйте ещё раз")
+    await bot.send_message(u["chat"], f"Видео получено по ссылке ({size / 1048576:.0f} МБ).")
+    asyncio.create_task(_start_job(u["chat"], job_id, caption))
+    return web.Response(text="ok")
+
+
 async def web_callback(req: web.Request):
     st = store.load().get("oauth_state") or {}
     if not st or req.query.get("state") != st.get("state"):
@@ -958,7 +1061,9 @@ async def main():
     store.update(lambda d: [d["jobs"][i].__setitem__("status", "review") for i in stuck
                             if d["jobs"][i]["status"] == "publishing"])
 
-    app = web.Application()
+    app = web.Application(client_max_size=8 * 1024 ** 3)
+    app.router.add_get("/up/{token}", web_upload_page)
+    app.router.add_post("/up/{token}", web_upload)
     app.router.add_get("/media/{job}/{key}/{name}", web_media)
     app.router.add_get("/ig/callback", web_callback)
     app.router.add_get("/", lambda r: web.Response(text="ok"))
