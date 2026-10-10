@@ -1,0 +1,456 @@
+"""Автомонтаж: из сырого видео и слов с таймингами делает готовый Reels 1080x1920.
+
+Шаги: вырезка пауз, оговорок и повторных дублей → чередование крупности (скрывает склейки)
+→ цвет → карточки-картинки по ключевым словам → субтитры по словам → плашка в конце
+→ музыка с приглушением под голос → громкость под Reels.
+"""
+import json
+import os
+import re
+import subprocess
+import tempfile
+
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+from .styles import ACCENT_AUTO, ACCENT_COLORS, END_CARD, NIGHT, PAPER, GOLD, STYLES, ass_color
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FONTS = os.path.join(HERE, "assets", "fonts")
+IMAGES = os.path.join(HERE, "assets", "images")
+
+W, H, FPS = 1080, 1920, 30
+MAX_GAP = 0.40       # паузы длиннее вырезаем
+PAD_BEFORE = 0.08
+PAD_AFTER = 0.16
+RETAKE_GAP = 0.9     # пауза, после которой ищем повторный дубль
+CARD_SECONDS = 2.2
+END_SECONDS = 2.4
+FILLERS = {"э", "ээ", "эээ", "эм", "эмм", "мм", "ммм", "хм", "а-а", "э-э"}
+
+
+def _norm(word: str) -> str:
+    return re.sub(r"[^\wё-]", "", word.lower())
+
+
+def ffprobe_duration(path: str) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return float(out.strip())
+
+
+# ---------- 1. что оставить ----------
+
+def _phrases(words):
+    """Делим речь на фразы по паузам."""
+    out, cur = [], []
+    for w in words:
+        if cur and w["start"] - cur[-1]["end"] > RETAKE_GAP:
+            out.append(cur)
+            cur = []
+        cur.append(w)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _drop_retakes(phrases):
+    """Если фраза начинается теми же двумя словами, что и предыдущая, значит предыдущую Полина переговорила."""
+    kept = []
+    for ph in phrases:
+        if kept:
+            prev = [_norm(w["word"]) for w in kept[-1][:2]]
+            cur = [_norm(w["word"]) for w in ph[:2]]
+            if len(prev) == 2 and prev == cur:
+                kept.pop()
+        kept.append(ph)
+    return kept
+
+
+def plan_cuts(words, duration):
+    """Возвращает (отрезки исходника [(start, end)], слова в новом времени)."""
+    words = [w for w in words if _norm(w["word"]) not in FILLERS]
+    words = [w for ph in _drop_retakes(_phrases(words)) for w in ph]
+    if not words:
+        return [(0.0, duration)], []
+
+    groups, cur = [], [words[0]]
+    for w in words[1:]:
+        if w["start"] - cur[-1]["end"] > MAX_GAP:
+            groups.append(cur)
+            cur = []
+        cur.append(w)
+    groups.append(cur)
+
+    segments, new_words, t_out, prev_end = [], [], 0.0, 0.0
+    for gi, g in enumerate(groups):
+        s = max(prev_end, g[0]["start"] - PAD_BEFORE, 0.0)
+        e = min(duration, g[-1]["end"] + PAD_AFTER)
+        if gi + 1 < len(groups):
+            e = min(e, groups[gi + 1][0]["start"] - 0.02)
+        if e - s < 0.15:
+            continue
+        for w in g:
+            new_words.append({
+                "word": w["word"],
+                "start": round(t_out + max(0.0, w["start"] - s), 3),
+                "end": round(t_out + min(e, w["end"]) - s, 3),
+                "seg": len(segments),
+                **({"accent": w["accent"]} if w.get("accent") else {}),
+                **({"i": w["i"]} if "i" in w else {}),
+            })
+        segments.append((round(s, 3), round(e, 3)))
+        t_out += e - s
+        prev_end = e
+    return segments, new_words
+
+
+def apply_plan(words, plan):
+    """Ручной или сгенерированный Claude план правок по номерам слов исходной расшифровки.
+
+    plan = {"delete": [[от, до], ...],      # вырезать слова (включительно): дубли, оговорки
+            "merge": [[от, до], ...],       # склеить в одно слово: «юго» + «-востоке»
+            "replace": {"номер": "текст"}}  # исправить написание в субтитрах
+    Номер слова сохраняется в поле "i", чтобы картинки и выделения находили своё место.
+    """
+    out = [dict(w, i=w.get("i", k)) for k, w in enumerate(words)]
+    rep = {int(k): v for k, v in (plan.get("replace") or {}).items()}
+    for w in out:
+        if w["i"] in rep:
+            w["word"] = rep[w["i"]]
+    for a, b in plan.get("merge") or []:
+        grp = [w for w in out if a <= w["i"] <= b]
+        if len(grp) < 2:
+            continue
+        text = grp[0]["word"]
+        for w in grp[1:]:
+            text += w["word"] if w["word"].startswith("-") or text.endswith("-") else " " + w["word"]
+        grp[0]["word"], grp[0]["end"] = text, grp[-1]["end"]
+        drop = {id(w) for w in grp[1:]}
+        out = [w for w in out if id(w) not in drop]
+    dels = plan.get("delete") or []
+    return [w for w in out if not any(a <= w["i"] <= b for a, b in dels)]
+
+
+# ---------- 2. карточки-картинки ----------
+
+def load_triggers():
+    path = os.path.join(HERE, "assets", "triggers.json")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def find_cards(words, triggers, total, not_before=0.0):
+    """По словам-ключам решаем, где показать картинку. Не чаще раза в 4 секунды.
+
+    Порядок ключей в triggers.json = приоритет: в «лунный календарь» победит календарь,
+    потому что смотрим на текущее слово и два следующих.
+    """
+    order = list(triggers)
+    cards, last = [], -10.0
+    for i, w in enumerate(words):
+        t = w["start"]
+        if t < not_before or t - last < 4.0 or t + CARD_SECONDS > total - END_SECONDS:
+            continue
+        if not any(_norm(w["word"]).startswith(k) for k in order):
+            continue
+        best = None
+        for x in words[i:i + 3]:
+            n = _norm(x["word"])
+            for rank, k in enumerate(order):
+                if n.startswith(k) and (best is None or rank < best):
+                    best = rank
+                    break
+        path = os.path.join(IMAGES, triggers[order[best]])
+        if os.path.exists(path):
+            cards.append({"t": t, "image": path})
+            last = t
+    return cards
+
+
+def make_card(src, dst, border_hex, width=None):
+    """Картинка в рамке со скруглением и тенью, 840 px по большей стороне.
+
+    border_hex=None: картинка как есть, без рамки (стиль Полины); width задаёт ширину в кадре.
+    """
+    im = Image.open(src).convert("RGBA")
+    if border_hex is None:
+        w = width or 600
+        im = im.resize((w, max(1, round(im.height * w / im.width))), Image.LANCZOS)
+        im.save(dst)
+        return
+    im.thumbnail((840, 840))
+    r = 36
+    mask = Image.new("L", im.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, im.width - 1, im.height - 1], r, fill=255)
+    im.putalpha(mask)
+    pad = 40
+    out = Image.new("RGBA", (im.width + pad * 2, im.height + pad * 2), (0, 0, 0, 0))
+    shadow = Image.new("L", out.size, 0)
+    ImageDraw.Draw(shadow).rounded_rectangle([pad, pad + 10, pad + im.width, pad + im.height + 10], r, fill=150)
+    out.putalpha(shadow.filter(ImageFilter.GaussianBlur(16)))
+    out.alpha_composite(im, (pad, pad))
+    ImageDraw.Draw(out).rounded_rectangle(
+        [pad - 3, pad - 3, pad + im.width + 2, pad + im.height + 2], r + 3, outline=border_hex, width=6)
+    out.save(dst)
+
+
+# ---------- 3. субтитры ----------
+
+def mark_accents(words, accents=None, auto=True):
+    """Помечает слова для выделения: {"phrase": "новолуние", "color": "red", "font": "Oranienbaum"}.
+
+    auto=True дополнительно выделяет ключевые слова из ACCENT_AUTO цветом и шрифтом стиля.
+    """
+    out = [dict(w) for w in words]
+    keys = [_norm(w["word"]) for w in out]
+    for a in accents or []:
+        target = [_norm(t) for t in a["phrase"].split() if _norm(t)]
+        n = len(target)
+        for i in range(len(keys) - n + 1):
+            if n and all(keys[i + k].startswith(target[k][:max(3, len(target[k]) - 2)]) for k in range(n)):
+                for k in range(n):
+                    out[i + k]["accent"] = {"color": a.get("color"), "font": a.get("font")}
+    if auto:
+        for w, k in zip(out, keys):
+            if "accent" not in w and any(k.startswith(p) for p in ACCENT_AUTO):
+                w["accent"] = {"color": None, "font": None}
+    return out
+
+
+def _display(word, upper, lower=False):
+    w = re.sub(r"[«»\"“”„.,:;…—–?!]", "", word).strip()
+    return w.upper() if upper else w.lower() if lower else w
+
+
+def build_ass(words, style, total, badge=None, title=None, end_seconds=END_SECONDS):
+    st = STYLES[style]
+    text_c, hi_c = ass_color(st["text"]), ass_color(st["highlight"])
+    outline_c = ass_color(st["outline"])
+    border_style = 3 if st["box"] else 1
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {W}", f"PlayResY: {H}", "WrapStyle: 0", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+        "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Sub,{st['font']},{st['font_size']},{text_c},{text_c},{outline_c},{ass_color(NIGHT, 0x90)},-1,0,0,0,100,100,1,0,"
+        f"{border_style},{st['outline_px']},{st.get('shadow_px', 0)},{8 if st.get('align') == 'top' else 2},90,90,"
+        f"{st.get('margin_v', 560)},204",
+        f"Style: Badge,Jost,46,{ass_color(GOLD)},{ass_color(GOLD)},{ass_color(NIGHT, 0x40)},{ass_color(NIGHT, 0x40)},-1,0,0,0,100,100,2,0,3,16,0,7,70,70,120,204",
+        f"Style: Title,Oranienbaum,96,{ass_color(PAPER)},{ass_color(PAPER)},{ass_color(NIGHT)},{ass_color(NIGHT, 0x30)},0,0,0,0,100,100,0,0,1,7,3,8,80,80,250,204",
+        f"Style: End,Oranienbaum,88,{ass_color(PAPER)},{ass_color(PAPER)},{ass_color(NIGHT)},{ass_color(NIGHT)},0,0,0,0,100,100,0,0,1,5,0,5,80,80,0,204",
+        "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    def ts(t):
+        t = max(0.0, t)
+        h, rem = divmod(t, 3600)
+        m, s = divmod(rem, 60)
+        return f"{int(h)}:{int(m):02d}:{s:05.2f}"
+
+    end_at = total - end_seconds
+    # группы по 2–3 слова, не через склейку и не через точку
+    groups, cur = [], []
+    for w in words:
+        if w["start"] >= end_at:
+            break
+        if cur and (len(cur) == st.get("max_words", 3) or w["seg"] != cur[-1]["seg"]
+                    or sum(len(x["word"]) for x in cur) + len(w["word"]) > st.get("max_chars", 18)
+                    or re.search(r"[.!?…]$", cur[-1]["word"])):
+            groups.append(cur)
+            cur = []
+        cur.append(w)
+    if cur:
+        groups.append(cur)
+
+    # «как у Полины»: всё строчными, кроме имён (слово с большой буквы не в начале фразы)
+    proper = set()
+    if st.get("lowercase"):
+        for prev, w in zip(words, words[1:]):
+            if w["word"][:1].isupper() and not re.search(r"[.!?…]$", prev["word"]):
+                proper.add(_norm(w["word"]))
+    lead = st.get("lead", 0.0)  # подпись появляется чуть раньше слова, сразу после предыдущей
+    prev_end = 0.0
+    for gi, g in enumerate(groups):
+        nxt = groups[gi + 1][0]["start"] - min(lead, max(0.0, groups[gi + 1][0]["start"] - g[-1]["end"])) \
+            if gi + 1 < len(groups) else end_at
+        g_end = min(g[-1]["end"] + 0.25 + lead, nxt, end_at)
+        for i, w in enumerate(g):
+            s = max(prev_end, w["start"] - lead) if i == 0 else w["start"]
+            e = g[i + 1]["start"] if i + 1 < len(g) else g_end
+            if e <= s:
+                continue
+            parts = []
+            for j, x in enumerate(g):
+                d = _display(x["word"], st["uppercase"], st.get("lowercase", False) and _norm(x["word"]) not in proper)
+                if x.get("accent"):
+                    a = x["accent"]
+                    c = a.get("color")
+                    col = ass_color(ACCENT_COLORS.get(c) or (c if c and c.startswith("#") else st["accent_color"]))
+                    font = a.get("font") or st["accent_font"]
+                    size = 112 if j == i else 104
+                    parts.append(f"{{\\fn{font}\\c{col}\\fscx{size}\\fscy{size}}}{d}"
+                                 f"{{\\fn{st['font']}\\c{text_c}\\fscx100\\fscy100}}")
+                elif j == i:
+                    parts.append("{\\c" + hi_c + "}" + d + "{\\c" + text_c + "}")
+                else:
+                    parts.append(d)
+            pop = "{\\fscx108\\fscy108\\t(0,90,\\fscx100\\fscy100)}" if i == 0 and st.get("pop", True) else ""
+            lines.append(f"Dialogue: 1,{ts(s)},{ts(e)},Sub,,0,0,0,,{pop}{' '.join(parts)}")
+        prev_end = g_end
+
+    if title:
+        lines.append(f"Dialogue: 2,{ts(0)},{ts(min(2.8, end_at))},Title,,0,0,0,,{{\\fad(150,250)}}{title}")
+    if badge:
+        lines.append(f"Dialogue: 2,{ts(0)},{ts(end_at)},Badge,,0,0,0,,☾ {badge}")
+    for k, part in enumerate(END_CARD.split("\\N") if end_seconds else []):
+        lines.append(f"Dialogue: 3,{ts(end_at)},{ts(total)},End,,0,0,0,,{{\\fad(250,0)\\pos({W // 2},{H // 2 - 60 + k * 120})}}{part}")
+    return "\n".join(lines) + "\n"
+
+
+# ---------- 4. сборка ----------
+
+def _zoom_expr(segments, zoom):
+    """Каждый второй отрезок крупнее: так склейки выглядят как смена плана."""
+    t, conds = 0.0, []
+    for i, (s, e) in enumerate(segments):
+        d = e - s
+        if i % 2 == 1:
+            conds.append(f"between(it,{t:.3f},{t + d:.3f})")
+        t += d
+    if not conds:
+        return "1"
+    return f"if({'+'.join(conds)},{zoom},1)"
+
+
+def render(src, words, out_path, style="night", music=None, badge=None, title=None, workdir=None, cards=True,
+           accents=None, auto_accents=True, extra_cards=None, auto_cards=True, end_card=True, preset="medium", seek=0.0):
+    """extra_cards: [{"word": номер слова в исходной расшифровке, "image": путь}] — картинки в заданные места."""
+    st = STYLES[style]
+    words = [dict(w, i=w.get("i", k)) for k, w in enumerate(words)]
+    words = mark_accents(words, accents, auto_accents)
+    work = workdir or tempfile.mkdtemp(prefix="factory_")
+    os.makedirs(work, exist_ok=True)
+    duration = ffprobe_duration(src) - seek
+    if seek:
+        # монтируем кусок длинного ролика: читаем исходник с отметки seek
+        words = [dict(w, start=round(w["start"] - seek, 3), end=round(w["end"] - seek, 3))
+                 for w in words if w["start"] >= seek]
+    segments, new_words = plan_cuts(words, duration)
+    total = sum(e - s for s, e in segments)
+    end_sec = END_SECONDS if end_card else 0.0
+
+    if not cards:
+        cards = []
+    else:
+        by_i = {w["i"]: w for w in new_words}
+        manual = []
+        for c in extra_cards or []:
+            w = by_i.get(c["word"])
+            if w is not None and os.path.exists(c["image"]):
+                manual.append({"t": w["start"], "image": c["image"]})
+        auto = find_cards(new_words, load_triggers(), total, not_before=2.9 if title else 0.0) if auto_cards else []
+        # автоматические картинки не ставим ближе 3 с к заданным вручную
+        auto = [a for a in auto if all(abs(a["t"] - m["t"]) > 3 for m in manual)]
+        cards = sorted(manual + auto, key=lambda c: c["t"])
+        for k, c in enumerate(cards):
+            nxt = cards[k + 1]["t"] if k + 1 < len(cards) else total - end_sec
+            c["dur"] = max(0.6, min(CARD_SECONDS, nxt - c["t"] - 0.05))
+    for i, c in enumerate(cards):
+        c["png"] = os.path.join(work, f"card{i}.png")
+        make_card(c["image"], c["png"], st["card_border"])
+
+    ass_path = os.path.join(work, "subs.ass")
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(build_ass(new_words, style, total, badge, title, end_sec))
+
+    inputs = (["-ss", f"{seek:.3f}"] if seek else []) + ["-i", src]
+    for c in cards:
+        inputs += ["-loop", "1", "-t", f"{c['dur']:.2f}", "-i", c["png"]]
+    music_idx = None
+    if music:
+        music_idx = 1 + len(cards)
+        inputs += ["-stream_loop", "-1", "-i", music]
+
+    fc = []
+    for i, (s, e) in enumerate(segments):
+        d = e - s
+        fc.append(f"[0:v]trim={s}:{e},setpts=PTS-STARTPTS[v{i}]")
+        fc.append(f"[0:a]atrim={s}:{e},asetpts=PTS-STARTPTS,afade=t=in:d=0.012,afade=t=out:st={max(0, d - 0.025):.3f}:d=0.025[a{i}]")
+    fc.append("".join(f"[v{i}][a{i}]" for i in range(len(segments))) + f"concat=n={len(segments)}:v=1:a=1[vc][ac]")
+    fc.append(
+        f"[vc]fps={FPS},scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,"
+        f"zoompan=z='{_zoom_expr(segments, st['zoom'])}':x='iw/2-(iw/zoom/2)':y='ih*0.4-(ih/zoom*0.4)':d=1:s={W}x{H}:fps={FPS},"
+        f"{st['grade']}[v_base]"
+    )
+    last = "v_base"
+    for i, c in enumerate(cards):
+        t, dur = c["t"], c["dur"]
+        fc.append(
+            f"[{i + 1}:v]format=rgba,fade=t=in:st=0:d=0.2:alpha=1,fade=t=out:st={dur - 0.25:.2f}:d=0.25:alpha=1,"
+            f"setpts=PTS-STARTPTS+{t:.3f}/TB[c{i}]"
+        )
+        fc.append(f"[{last}][c{i}]overlay=x=(W-w)/2:y=200:eof_action=pass:enable='between(t,{t:.3f},{t + dur:.3f})'[o{i}]")
+        last = f"o{i}"
+    end_at = total - end_sec if end_sec else total + 1
+    ass_esc = ass_path.replace("\\", "/").replace(":", "\\:")
+    fonts_esc = FONTS.replace(":", "\\:")
+    fc.append(
+        f"[{last}]drawbox=x=0:y=0:w=iw:h=ih:color=0x15122A@0.6:t=fill:enable='gte(t,{end_at:.3f})',"
+        f"ass='{ass_esc}':fontsdir='{fonts_esc}',format=yuv420p[vout]"
+    )
+    fc.append("[ac]highpass=f=80,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[voice]")
+    if music_idx is not None:
+        fc.append("[voice]asplit[v1][v2]")
+        fc.append(f"[{music_idx}:a]atrim=0:{total:.3f},asetpts=PTS-STARTPTS,aresample=48000,volume=0.22,"
+                  f"afade=t=out:st={max(0, total - 1.5):.3f}:d=1.5[mus]")
+        fc.append("[mus][v1]sidechaincompress=threshold=0.02:ratio=10:attack=15:release=350[duck]")
+        fc.append("[v2][duck]amix=inputs=2:duration=first:normalize=0[aout]")
+    else:
+        fc.append("[voice]anull[aout]")
+
+    graph_path = os.path.join(work, "graph.txt")
+    with open(graph_path, "w") as f:
+        f.write(";\n".join(fc))
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs,
+           "-filter_complex_script", graph_path, "-map", "[vout]", "-map", "[aout]",
+           "-t", f"{total:.3f}", "-c:v", "libx264", "-preset", preset, "-crf", "20", "-r", str(FPS),
+           "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_path]
+    subprocess.run(cmd, check=True)
+    return {"segments": segments, "words": new_words, "cards": [c["t"] for c in cards], "duration": round(total, 2),
+            "cut_seconds": round(duration - total, 2)}
+
+
+def make_cover(video_path, title, out_path, at=0.8):
+    """Обложка: кадр из ролика + заголовок Oranienbaum на тёмной полосе."""
+    frame = out_path + ".frame.png"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(at), "-i", video_path, "-frames:v", "1", frame],
+                   check=True)
+    im = Image.open(frame).convert("RGB")
+    os.remove(frame)
+    band = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(band)
+    for y in range(900, H):
+        a = int(min(1.0, (y - 900) / 500) * 215)
+        d.line([(0, y), (W, y)], fill=(0x15, 0x12, 0x2A, a))
+    im = Image.alpha_composite(im.convert("RGBA"), band)
+    d = ImageDraw.Draw(im)
+    font = ImageFont.truetype(os.path.join(FONTS, "Oranienbaum.ttf"), 112)
+    words, lines, cur = title.split(), [], ""
+    for w in words:
+        test = (cur + " " + w).strip()
+        if d.textlength(test, font=font) > W - 160 and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = test
+    lines.append(cur)
+    y = 1500 - len(lines) * 120
+    for ln in lines:
+        tw = d.textlength(ln, font=font)
+        d.text(((W - tw) / 2, y), ln, font=font, fill=PAPER)
+        y += 124
+    d.line([(W / 2 - 60, y + 30), (W / 2 + 60, y + 30)], fill=GOLD, width=4)
+    im.convert("RGB").save(out_path, quality=92)
+    return out_path
