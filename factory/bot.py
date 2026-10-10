@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import time
 import uuid
 from zoneinfo import ZoneInfo
@@ -105,7 +106,7 @@ HELP = (
     "В рассказах и скетчах Claude читает расшифровку как сценарий: убирает дубли, оговорки и вводные, "
     "ставит наезды и картинки, а перед отправкой сам проверяет кадры. Вернуть вырезанное: «оставь кусок про …», "
     "всё заново: «смонтируй заново». Если одну правку просите в разных роликах, я предложу её запомнить.\n\n"
-    "Видео больше 20 МБ: /upload даст ссылку, по которой его можно загрузить прямо на сервер.\n\n"
+    "Видео больше 20 МБ: /upload даст ссылку, по которой его можно загрузить прямо на сервер. /last пришлёт последний готовый ролик ещё раз.\n\n"
     "/edits все виды правок\n/forget забыть запомненные настройки\n/plan очередь публикаций\n/stats статистика Instagram\n/style стиль по умолчанию: как у Полины, ночной или светлый\n"
     "/pause и /resume остановить или возобновить публикации\n/instagram подключить Instagram\n"
     "/invite код для второго человека"
@@ -450,11 +451,30 @@ GENRE_QUESTION = ("Что это за ролик?\n🎓 Рассказ: монт
                   "только субтитры и цвет.\n😂 Скетч: плотная нарезка, без картинок.")
 
 
+TG_SEND_LIMIT = 48 * 1024 * 1024   # Telegram принимает от бота файлы до 50 МБ (свой сервер Bot API — до 2 ГБ)
+
+
+def _small_copy(src: str, dst: str, seconds: float) -> str:
+    """Лёгкая копия для показа в Telegram; полный ролик остаётся для Instagram и скачивания."""
+    kbps = max(400, int(44 * 8 * 1024 / max(seconds, 1)) - 128)
+    vf = [] if kbps >= 2500 else ["-vf", "scale=720:1280"]
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, *vf, "-c:v", "libx264", "-preset", "veryfast",
+                    "-b:v", f"{kbps}k", "-maxrate", f"{int(kbps * 1.3)}k", "-bufsize", f"{kbps * 2}k",
+                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", dst], check=True)
+    return dst
+
+
 async def _send_preview(chat_id: int, job_id: str):
     j = store.load()["jobs"][job_id]
     f = _job_files(job_id)
+    video, full_link = f["out"], ""
+    if not LOCAL_API and os.path.getsize(f["out"]) > TG_SEND_LIMIT:
+        video = await asyncio.to_thread(_small_copy, f["out"], os.path.join(f["dir"], "preview.mp4"),
+                                        float(j.get("duration") or 60))
+        if PUBLIC_URL:
+            full_link = f"\n\nВ Telegram ролик сжат, полное качество: {PUBLIC_URL}/media/{job_id}/{j['key']}/final.mp4"
     # без размеров Telegram иногда показывает вертикальный ролик квадратом
-    await bot.send_video(chat_id, FSInputFile(f["out"]), cover=FSInputFile(f["cover"]),
+    await bot.send_video(chat_id, FSInputFile(video), cover=FSInputFile(f["cover"]),
                          supports_streaming=True, width=1080, height=1920, duration=int(round(j.get("duration") or 0)) or None,
                          caption=f"{_genre(j)['name']} · {STYLE_NAMES[j['style']]} стиль · "
                                  + (j.get("plan_line") or f"{j['duration']:.0f} с, вырезано {j['cut_seconds']:.0f} с пауз и оговорок"))
@@ -463,7 +483,24 @@ async def _send_preview(chat_id: int, job_id: str):
         text += "\n\n<i>Подпись по шаблону: ключ Claude не подключён.</i>"
     for w in j.get("warnings") or []:
         text += f"\n⚠️ {html.escape(w)}"
-    await bot.send_message(chat_id, text[:4000], reply_markup=_kb(job_id))
+    await bot.send_message(chat_id, text[:4000 - len(full_link)] + full_link, reply_markup=_kb(job_id))
+
+
+@dp.message(Command("last"))
+async def cmd_last(m: Message):
+    """Прислать последний смонтированный ролик ещё раз (например, если отправка сорвалась)."""
+    if not _allowed(m.from_user.id):
+        return
+    jobs = sorted((j for j in store.load()["jobs"].values() if j.get("chat_id") == m.chat.id
+                   and os.path.exists(_job_files(j["id"])["out"]) and j.get("title")),
+                  key=lambda j: j.get("created", 0), reverse=True)
+    if not jobs:
+        await m.answer("Готовых роликов пока нет.")
+        return
+    j = jobs[0]
+    if j["status"] == "failed":
+        store.update(lambda d: d["jobs"][j["id"]].__setitem__("status", "review"))
+    await _send_preview(m.chat.id, j["id"])
 
 
 async def _process(chat_id: int, job_id: str, new_caption: bool, hint: str | None = None):
