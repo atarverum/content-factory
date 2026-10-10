@@ -115,7 +115,13 @@ http://${IP//./-}.sslip.io {
 }
 ${IP//./-}.sslip.io:8444 {
 	bind 127.0.0.1
-	reverse_proxy 127.0.0.1:8080
+	handle_path /sub/* {
+		root * /etc/xray-sub
+		file_server
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8080
+	}
 }
 EOF
 else

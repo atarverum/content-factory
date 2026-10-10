@@ -13,6 +13,7 @@
 #   bash install-vpn.sh move443  перенести старую установку с порта 8443 на 443
 #   bash install-vpn.sh xhttp    добавить второй вход VLESS через XHTTP на порту 8443
 #   bash install-vpn.sh all      поставить всё сразу (XHTTP + Hysteria2) и показать все ключи
+#   bash install-vpn.sh auto     подписка для Happ с автопереключением (XHTTP на 443 и 8443)
 #   bash install-vpn.sh hy2      добавить запасной протокол Hysteria2 (UDP 443)
 #   bash install-vpn.sh clash    файл настроек для Clash Verge Rev
 #   bash install-vpn.sh sni САЙТ сменить сайт маскировки (self — сайт фабрики)
@@ -36,10 +37,11 @@ print_key() {  # $1 = uuid, $2 = подпись
   # shellcheck disable=SC1090
   . "$STATE"
   local link="vless://$1@$IP:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=tcp#$2"
-  if [ "${3:-}" = xhttp ]; then
-    link="vless://$1@$IP:8443?encryption=none&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=xhttp&path=%2F$XPATH&mode=auto#$2-XHTTP"
-  fi
-  say "Ключ «$2${3:+ (XHTTP)}» (скопируйте целиком одной строкой)"
+  case "${3:-}" in
+    xhttp) link="vless://$1@$IP:8443?encryption=none&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=xhttp&path=%2F$XPATH&mode=auto#$2-XHTTP" ;;
+    xhttp443) link="vless://$1@$IP:443?encryption=none&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=xhttp&path=%2F$XPATH&mode=auto#$2-XHTTP-443" ;;
+  esac
+  say "Ключ «$2${3:+ ($3)}» (скопируйте целиком одной строкой)"
   echo "$link"
   echo
   qrencode -t ansiutf8 -m 1 "$link"
@@ -59,7 +61,14 @@ http://$1 {
 }
 $1:$CADDY_PORT {
 	bind 127.0.0.1
-	reverse_proxy 127.0.0.1:8080
+	# Подписки VPN для Happ (файлы с секретными именами, см. команду auto).
+	handle_path /sub/* {
+		root * /etc/xray-sub
+		file_server
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8080
+	}
 }
 EOF
 }
@@ -120,7 +129,7 @@ if [ -f "$STATE" ]; then
       python3 - "$CFG" <<'PY' | while read -r id name kind; do print_key "$id" "$name" "$kind"; done
 import json, sys
 for ib in json.load(open(sys.argv[1]))["inbounds"]:
-    kind = "xhttp" if ib.get("tag") == "xhttp" else ""
+    kind = "xhttp" if ib.get("tag") == "xhttp" else ("xhttp443" if ib["streamSettings"]["network"] == "xhttp" else "")
     for c in ib["settings"]["clients"]:
         print(c["id"], c.get("email", "VPN"), kind)
 PY
@@ -135,13 +144,14 @@ import json, sys
 p, uid, name = sys.argv[1:]
 cfg = json.load(open(p))
 for ib in cfg["inbounds"]:
-    flow = "" if ib.get("tag") == "xhttp" else "xtls-rprx-vision"
+    flow = "" if ib["streamSettings"]["network"] == "xhttp" else "xtls-rprx-vision"
     ib["settings"]["clients"].append({"id": uid, "flow": flow, "email": name})
 json.dump(cfg, open(p, "w"), indent=2)
 PY
       systemctl restart xray
       print_key "$NEW" "$NAME"
       if grep -q '"tag": "xhttp"' "$CFG"; then print_key "$NEW" "$NAME" xhttp; fi
+      if [ -d /etc/xray-sub ]; then echo; echo "Подписку с автопереключением для $NAME покажет: bash install-vpn.sh auto"; fi
       exit 0 ;;
     move443)
       if [ "$PORT" = 443 ]; then echo "VPN уже на порту 443."; exit 0; fi
@@ -270,12 +280,97 @@ EOF
       say "Файл для Clash Verge Rev готов: $OUT"
       echo "Скачайте его на Mac командой (на Mac): scp root@$IP:$OUT ~/Downloads/"
       exit 0 ;;
+    auto)
+      # Подписка для Happ с автопереключением: два входа XHTTP (порты 443 и 8443). Happ раз в минуту
+      # проверяет, через какой реально открываются сайты, и идёт через лучший. Русские сайты идут напрямую.
+      [ "$PORT" = 443 ] || die "сначала: bash install-vpn.sh move443"
+      grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
+      # shellcheck disable=SC1090
+      . "$STATE"
+      # Основной вход на 443 тоже переводим на XHTTP: «tcp + Vision» российские провайдеры режут.
+      python3 - "$CFG" "$XPATH" <<'PY'
+import json, sys
+p, path = sys.argv[1:]
+cfg = json.load(open(p))
+ib = cfg["inbounds"][0]
+ib["streamSettings"]["network"] = "xhttp"
+ib["streamSettings"]["xhttpSettings"] = {"path": "/" + path, "mode": "auto"}
+for c in ib["settings"]["clients"]:
+    c["flow"] = ""
+json.dump(cfg, open(p, "w"), indent=2)
+PY
+      xray run -test -config "$CFG" >/dev/null || die "Xray не принял настройки"
+      DOMAIN="${IP//./-}.sslip.io"
+      mkdir -p /etc/xray-sub
+      python3 - "$CFG" "$IP" "$SNI" "$PUB" "$SID" "$XPATH" <<'PY' > /etc/xray-sub/.list
+import json, sys, hashlib
+p, ip, sni, pub, sid, path = sys.argv[1:]
+cfg = json.load(open(p))
+priv = cfg["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"]
+sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}
+for c in cfg["inbounds"][0]["settings"]["clients"]:
+    uid, name = c["id"], c.get("email", "VPN")
+    token = hashlib.sha256((uid + priv).encode()).hexdigest()[:24]
+    def out(tag, port):
+        return {"tag": tag, "protocol": "vless",
+                "settings": {"vnext": [{"address": ip, "port": port,
+                    "users": [{"id": uid, "encryption": "none", "flow": ""}]}]},
+                "streamSettings": {"network": "xhttp", "security": "reality",
+                    "xhttpSettings": {"path": "/" + path, "mode": "auto"},
+                    "realitySettings": {"serverName": sni, "fingerprint": "chrome",
+                        "publicKey": pub, "shortId": sid}}}
+    conf = {
+        "remarks": "Наш VPN · авто",
+        "dns": {"servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
+                "queryStrategy": "UseIPv4"},
+        "inbounds": [
+            {"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+             "settings": {"auth": "noauth", "udp": True}, "sniffing": sniff},
+            {"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http",
+             "settings": {}, "sniffing": sniff}],
+        "outbounds": [out("vpn-443", 443), out("vpn-8443", 8443),
+                      {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
+                      {"tag": "block", "protocol": "blackhole"}],
+        "observatory": {"subjectSelector": ["vpn-"], "probeURL": "https://www.google.com/generate_204",
+                        "probeInterval": "1m", "enableConcurrency": True},
+        "routing": {"domainStrategy": "IPIfNonMatch",
+            "balancers": [{"tag": "auto", "selector": ["vpn-"], "strategy": {"type": "leastPing"},
+                           "fallbackTag": "vpn-8443"}],
+            "rules": [
+                {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+                {"type": "field", "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"],
+                 "outboundTag": "direct"},
+                {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"},
+                {"type": "field", "network": "tcp,udp", "balancerTag": "auto"}]}}
+    with open("/etc/xray-sub/" + token, "w") as f:
+        json.dump(conf, f, ensure_ascii=False, indent=2)
+    print(token, name)
+PY
+      chmod 755 /etc/xray-sub; chmod 644 /etc/xray-sub/*
+      if ! grep -q 'handle_path /sub/' /etc/caddy/Caddyfile; then
+        cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.before-sub
+        write_caddyfile "$DOMAIN"
+        caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+          || { cp /etc/caddy/Caddyfile.before-sub /etc/caddy/Caddyfile; die "Caddy не принял настройки, вернул как было"; }
+        systemctl restart caddy
+      fi
+      systemctl restart xray; sleep 2
+      systemctl is-active -q xray || die "VPN не запустился"
+      while read -r token name; do
+        URL="https://$DOMAIN/sub/$token"
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$URL" || true)
+        say "Подписка «$name» (проверка: $code). Скопируйте ссылку целиком:"
+        echo "$URL"
+        echo
+        qrencode -t ansiutf8 -m 1 "$URL"
+      done < /etc/xray-sub/.list
+      exit 0 ;;
     all)
       bash "$0" sni self >/dev/null
       grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
       [ -f /etc/hysteria/vpn.env ] || bash "$0" hy2 >/dev/null
       exec bash "$0" show ;;
-    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all и clash)" ;;
+    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all, auto и clash)" ;;
   esac
 fi
 
