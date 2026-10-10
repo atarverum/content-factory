@@ -66,7 +66,7 @@ $1:$CADDY_PORT {
 		# Happ сам обновляет подписку раз в час.
 		header Content-Type "application/json; charset=utf-8"
 		header profile-update-interval "1"
-		header profile-title "base64:4ZqxIFJhaWRvIFZQTg=="
+		header profile-title "base64:8J+Hs/Cfh7EgUmFpZG8gTkw="
 		root * /etc/xray-sub
 		file_server
 	}
@@ -324,7 +324,7 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
                     "realitySettings": {"serverName": sni, "fingerprint": "chrome",
                         "publicKey": pub, "shortId": sid}}}
     conf = {
-        "remarks": "ᚱ Raido VPN",
+        "remarks": "🇳🇱 Raido NL",
         "dns": {"servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
                 "queryStrategy": "UseIPv4"},
         "inbounds": [
