@@ -134,6 +134,8 @@ if [ -f "$STATE" ]; then
       python3 - "$CFG" <<'PY' | while read -r id name kind; do print_key "$id" "$name" "$kind"; done
 import json, sys
 for ib in json.load(open(sys.argv[1]))["inbounds"]:
+    if ib.get("protocol") != "vless":
+        continue
     kind = "xhttp" if ib.get("tag") == "xhttp" else ("xhttp443" if ib["streamSettings"]["network"] == "xhttp" else "")
     for c in ib["settings"]["clients"]:
         print(c["id"], c.get("email", "VPN"), kind)
@@ -149,6 +151,8 @@ import json, sys
 p, uid, name = sys.argv[1:]
 cfg = json.load(open(p))
 for ib in cfg["inbounds"]:
+    if ib.get("protocol") != "vless":
+        continue
     flow = "" if ib["streamSettings"]["network"] == "xhttp" else "xtls-rprx-vision"
     ib["settings"]["clients"].append({"id": uid, "flow": flow, "email": name})
 json.dump(cfg, open(p, "w"), indent=2)
