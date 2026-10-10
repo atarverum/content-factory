@@ -35,7 +35,7 @@ EMPTY = {
     "music": None, "music_vol": None, "voice_vol": None, "denoise": None, "sounds": [],
     # эффекты
     "effects": [],
-    # что очистить целиком: sounds, effects, zoom_words, accents, cards_off, fixes, removed, color, images
+    # что очистить целиком: sounds, effects, zoom_words, accents, cards_off, fixes, removed, color, images, plan
     "clear": [],
     # текст в кадре
     "style": None, "title": None, "title_on": None, "badge": None, "end_card": None,
@@ -60,7 +60,7 @@ LIST_OPTS = ["zoom_words", "cards_off", "fixes", "sounds", "effects", "smooth", 
 GENRES = {
     "talk": {"name": "рассказ", "desc": "нарезка, картинки, выделения, как ролики Полины", "opts": {}, "job": {"no_cards": None, "auto_accents": None, "cta": True}},
     "vlog": {"name": "влог / зарисовка", "desc": "ролик целиком, без вырезаний, картинок и заголовка, только субтитры",
-             "opts": {"cut": "none", "zoom": "off", "title_on": False, "end_card": False},
+             "opts": {"cut": "none", "zoom": "off", "title_on": False, "end_card": False, "speed": 1.0},
              "job": {"no_cards": True, "auto_accents": False, "cta": False}},
     "sketch": {"name": "скетч / комедия", "desc": "плотная нарезка, без картинок и заголовка",
                "opts": {"cut": "tight", "title_on": False, "end_card": False},
@@ -200,6 +200,10 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
         if re.search(r"ссылк|телеграм|призыв", c) and e["cta"] is not None and not re.search(r"подпис\w*\s*[:—-]?\s*[«\"]", raw):
             continue
         if re.search(r"больше ничего не делай|ничего больше не делай|ничего лишнего|от начала (?:и )?до конца", c):
+            continue
+
+        if re.search(r"смонтируй (?:заново|с нуля|по-новому)|перемонтируй (?:вс[её] |полностью |)(?:заново|с нуля)|начни монтаж заново", c):
+            e["clear"].append("plan")
             continue
 
         # ── публикация
@@ -487,7 +491,8 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
             elif not e["smooth"] and not re.search(r"после слов", whole):
                 e["cut"] = e["cut"] or "gentle"
             continue
-        if re.search(r"верни\w*", c) and (q or re.search(r"фраз|кусок|слов|момент", c)):
+        if (re.search(r"верни\w*", c) and (q or re.search(r"фраз|кусок|слов|момент", c))) or \
+                (re.search(r"\bоставь|не выреза\w*|не убира\w*", c) and (q or re.search(r"фраз|кусок|момент|\bпро\s", c))):
             if q or tgt:
                 e["restore_phrases"].append(q[0] if q else tgt)
             else:
@@ -710,8 +715,8 @@ def apply(job: dict, e: dict) -> dict:
         job["genre"] = e["genre"]
         for k in g["opts"]:
             o.pop(k, None)  # настройки жанра заменяют прежние
-        for k in ("no_cards", "auto_accents", "cta"):
-            job.pop(k, None)
+        for k in ("no_cards", "auto_accents", "cta", "plan"):
+            job.pop(k, None)  # новый жанр — новый монтажный лист
         render = recaption = True
     if e.get("minimal"):
         o.update({"cut": "none", "zoom": "off", "title_on": False, "end_card": False, "sounds": [], "effects": [],
@@ -733,6 +738,9 @@ def apply(job: dict, e: dict) -> dict:
             render = True
         elif k == "images":
             job["images"] = []
+            render = True
+        elif k == "plan":
+            job.pop("plan", None)
             render = True
         elif k in LIST_OPTS:
             o[k] = []
@@ -902,7 +910,7 @@ def summary(e: dict) -> list[str]:
             s.append(f"эффект «{library.EFFECTS[x['effect']][1]}» на «{x['phrase']}»")
     names = {"sounds": "звуки", "effects": "эффекты", "zoom_words": "наезды", "cards_off": "убранные картинки",
              "accents": "выделения", "fixes": "исправления", "removed": "вырезанные фразы", "color": "цвет",
-             "images": "найденные картинки"}
+             "images": "найденные картинки", "plan": "монтажный лист, смонтирую заново"}
     for k in e.get("clear") or []:
         if k == "removed":
             s.append("верну всё вырезанное вручную")

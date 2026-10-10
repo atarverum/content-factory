@@ -72,7 +72,7 @@ def _edit_spec() -> dict:
         "sounds": ("list", obj({"phrase": s, "sound": {"type": "string", "enum": list(library.SOUNDS)}})),
         "effects": ("list", obj({"phrase": s, "effect": {"type": "string", "enum": list(library.EFFECTS)}})),
         "clear": ("list", {"type": "string", "enum": ["sounds", "effects", "zoom_words", "accents", "cards_off", "fixes",
-                                                      "removed", "color", "images"]}),
+                                                      "removed", "color", "images", "plan"]}),
         "style": ("str", ["polina", "night", "paper"]), "title": ("str", None), "title_on": ("bool", None),
         "badge": ("str", None), "end_card": ("bool", None),
         "caption": ("str", None), "recaption": ("bool", None), "cta": ("bool", None),
@@ -146,7 +146,8 @@ def _client():
 LAST_ERROR = ""  # почему Claude не ответил в последний раз (бот показывает это при упрощённом разборе)
 
 
-def _ask(system: str, user: str, schema: dict) -> dict | None:
+def _ask(system: str, user, schema: dict, max_tokens: int = 4000) -> dict | None:
+    """Запрос к Claude с ответом строго по схеме. user — текст или список блоков (текст и картинки)."""
     global LAST_ERROR
     LAST_ERROR = ""
     client = _client()
@@ -156,7 +157,7 @@ def _ask(system: str, user: str, schema: dict) -> dict | None:
     try:
         resp = client.beta.messages.create(
             model=MODEL,
-            max_tokens=4000,
+            max_tokens=max_tokens,
             betas=[FALLBACK_BETA],
             fallbacks="default",
             system=system,
@@ -310,6 +311,8 @@ images: новая картинка из интернета: phrase — слов
 слово из расшифровки. Мемы и персонажей из мультфильмов там не найти: тогда попроси прислать фото (unsupported).
 card_scale: множитель размера. card_pos: где показывать. card_secs: сколько секунд показывать (обычно 2.2).
 Звук. music: с музыкой или без. music_vol / voice_vol: множитель громкости. denoise: убрать шум.
+clear: ["plan"] — «смонтируй заново», «перемонтируй с нуля»: монтажный лист (что вырезано, наезды, картинки) составится заново.
+restore_phrases работает и для кусков, которые вырезал монтажный лист («оставь кусок про Якова»).
 sounds: звуковой эффект на фразе из расшифровки. effects: видеоэффект на фразе (bw — чёрно-белая вставка
 только на этом месте). clear: что сбросить целиком («убери все звуки» → sounds).
 Текст в кадре. style: polina (как у Полины), night (тёмный), paper (светлый). title: новый заголовок в начале

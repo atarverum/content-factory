@@ -477,16 +477,155 @@ def style_with(style, opts):
 
 
 def _zoom_expr2(seg_durs, base, punches):
-    """Чередование крупности по склейкам (base) и наезды на нужных словах (punches: [(от, до, крупность)])."""
+    """Чередование крупности по склейкам (base) и наезды (punches: [(от, до, крупность в начале, в конце)])."""
     t, alt = 0.0, []
     for i, d in enumerate(seg_durs):
         if i % 2 == 1 and base > 1.0:
             alt.append(f"between(it,{t:.3f},{t + d:.3f})")
         t += d
     expr = f"if({'+'.join(alt)},{base},1)" if alt else "1"
-    for a, b, z in punches:
-        expr = f"if(between(it,{a:.3f},{b:.3f}),{z},{expr})"
+    for a, b, z0, z1 in punches:
+        val = f"{z0}" if z0 == z1 else f"{z0}+({z1 - z0:.3f})*(it-{a:.3f})/{max(0.1, b - a):.3f}"
+        expr = f"if(between(it,{a:.3f},{b:.3f}),{val},{expr})"
     return expr
+
+
+# наезды из монтажного листа: резкий на панчлайне, медленный на подводке, удержание на ремарке
+ZOOMS = {"punch": (1.7, 1.7, 0.9), "push": (1.05, 1.45, 0.3), "hold": (1.3, 1.3, 0.4)}
+
+
+def _zoom_marks(new_words, marks, total, strong=False):
+    by_i = {w["i"]: w for w in new_words}
+    out = []
+    for m in marks or []:
+        ws = [by_i[i] for i in range(m["from"], m["to"] + 1) if i in by_i]
+        if not ws or m.get("kind") not in ZOOMS:
+            continue
+        z0, z1, tail = ZOOMS[m["kind"]]
+        if strong:
+            z0, z1 = round(z0 * 1.1, 2), round(z1 * 1.1, 2)
+        a = max(0.0, ws[0]["start"] - 0.05)
+        b = min(total, ws[-1]["end"] + tail)
+        if m["kind"] == "push":
+            b = min(total, max(b, a + 1.5))
+        out.append((a, b, z0, z1))
+    return out
+
+
+def _no_overlap(punches):
+    """Наезды не наслаиваются: следующий начинается не раньше, чем кончился предыдущий."""
+    out = []
+    for p in sorted(punches):
+        if out and p[0] < out[-1][1]:
+            continue
+        out.append(p)
+    return out
+
+
+# ---------- замер кадра: лицо и цвет ----------
+
+def _sample_times(segments, seek, n=6):
+    total = sum(e - s for s, e in segments) or 1.0
+    out, acc = [], 0.0
+    targets = [total * (k + 0.5) / n for k in range(n)]
+    for s, e in segments:
+        for t in targets:
+            if acc <= t < acc + (e - s):
+                out.append(seek + s + (t - acc))
+        acc += e - s
+    return out
+
+
+def _frame(src, t, w=None):
+    """Кадр исходника, уже вписанный в 1080x1920, как в ролике (RGB, numpy-массив или PIL)."""
+    vf = f"scale='trunc(iw*sar/2)*2':ih,setsar=1,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
+    if w:
+        vf += f",scale={w}:-2"
+    out = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", src, "-frames:v", "1",
+                          "-vf", vf, "-f", "image2pipe", "-vcodec", "png", "-"], capture_output=True, check=True).stdout
+    import io
+    return Image.open(io.BytesIO(out)).convert("RGB")
+
+
+def face_zone(src, segments, seek=0.0):
+    """Где в кадре лицо: (верх, низ) в пикселях ролика 1080x1920, по нескольким кадрам. None — не нашли."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        cascade = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"))
+        boxes = []
+        for t in _sample_times(segments, seek, 5):
+            im = _frame(src, t, w=360)
+            gray = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2GRAY)
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+            if len(faces):
+                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                k = W / 360
+                boxes.append((y * k, (y + h) * k))
+        if not boxes:
+            return None
+        boxes.sort()
+        mid = boxes[len(boxes) // 2]
+        # с запасом: подбородок и волосы тоже лицо
+        h = mid[1] - mid[0]
+        return (float(max(0, mid[0] - 0.25 * h)), float(min(H, mid[1] + 0.35 * h)))
+    except Exception:
+        return None
+
+
+def _free_spot(pref, face, card_h, st):
+    """Куда поставить картинку высотой card_h, чтобы не закрыть лицо и субтитры. pref — куда хочется по стилю."""
+    spots = {"top": (200, 200 + card_h), "middle": ((H - card_h) / 2, (H + card_h) / 2),
+             "bottom": (H - card_h - 260, H - 260)}
+    sub_top = st.get("align") == "top"
+    sub = (st.get("margin_v", 205), st.get("margin_v", 205) + 260) if sub_top else (H - st.get("margin_v", 380) - 260, H - st.get("margin_v", 380))
+
+    def clash(a, b):
+        return max(0, min(a[1], b[1]) - max(a[0], b[0]))
+    order = [pref] + [p for p in ("bottom", "top", "middle") if p != pref]
+    best = min(order, key=lambda p: (clash(spots[p], face) > 40, clash(spots[p], sub) > 40, order.index(p)))
+    return best
+
+
+def measured_grade(src, segments, seek=0.0, limit=0.08):
+    """Небольшая поправка по замеру кадров перед цветом стиля: яркость, насыщенность, баланс белого (±8 %)."""
+    try:
+        ys, ss, us, vs = [], [], [], []
+        for t in _sample_times(segments, seek, 5):
+            out = subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", src, "-frames:v", "1",
+                 "-vf", "scale=270:-2,signalstats,metadata=print:file=-", "-f", "null", "-"],
+                capture_output=True, text=True, check=True).stdout
+            vals = dict(re.findall(r"lavfi\.signalstats\.(\w+)=([\d.]+)", out))
+            if "YAVG" in vals:
+                ys.append(float(vals["YAVG"]))
+                ss.append(float(vals.get("SATAVG", 0)))
+                us.append(float(vals.get("UAVG", 128)))
+                vs.append(float(vals.get("VAVG", 128)))
+        if not ys:
+            return ""
+        n = len(ys)
+        y, sat, u, v = sum(ys) / n, sum(ss) / n, sum(us) / n, sum(vs) / n
+
+        def clamp(x):
+            return max(-limit, min(limit, x))
+        bright = clamp((118 - y) / 255 * 0.6)        # тёмное видео чуть светлее, пересвеченное чуть темнее
+        satk = 1 + clamp((32 - sat) / 32 * 0.25)    # блёклое чуть сочнее, кислотное чуть спокойнее
+        # баланс белого: V > 128 — краснит, U > 128 — синит; убираем треть сдвига и не больше 5 %,
+        # чтобы кожа не ушла в серый или зелёный (тёплый образ стиля всё равно ляжет сверху)
+        rs = max(-0.05, min(0.05, -(v - 128) / 128 * 0.33))
+        bs = max(-0.05, min(0.05, -(u - 128) / 128 * 0.33))
+        parts = []
+        if abs(bright) > 0.01 or abs(satk - 1) > 0.01:
+            parts.append(f"eq=brightness={bright:.3f}:saturation={satk:.3f}")
+        if abs(rs) > 0.01 or abs(bs) > 0.01:
+            parts.append(f"colorbalance=rm={rs:.3f}:bm={bs:.3f}")
+        return ",".join(parts) + ("," if parts else "")
+    except Exception:
+        return ""
 
 
 def render(src, words, out_path, style="night", music=None, badge=None, title=None, workdir=None, cards=True,
@@ -527,7 +666,7 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
     if (a > 0 or b < total) and b - a > 1.0:
         segments, new_words = crop_output(segments, new_words, a, b)
         total = sum(e - s for s, e in segments)
-    speed = max(0.5, min(2.0, float(o.get("speed") or 1.0)))
+    speed = max(0.5, min(2.0, float(o.get("speed") or st.get("speed") or 1.0)))
     seg_durs = [(e - s) / speed for s, e in segments]
     if speed != 1.0:
         new_words = [dict(w, start=round(w["start"] / speed, 3), end=round(w["end"] / speed, 3)) for w in new_words]
@@ -542,14 +681,16 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
         cards = []
     else:
         by_i = {w["i"]: w for w in new_words}
+        off = [p for ph in o.get("cards_off") or [] for p in ph.split() if _norm(p)]
         manual = []
         for c in extra_cards or []:
             w = by_i.get(c["word"])
-            if w is not None and os.path.exists(c["image"]):
+            if w is not None and os.path.exists(c["image"]) and not any(same_word(w["word"], k) for k in off):
                 manual.append({"t": w["start"], "image": c["image"]})
+        manual = [m for k, m in enumerate(sorted(manual, key=lambda m: m["t"]))
+                  if k == 0 or m["t"] - sorted(manual, key=lambda m: m["t"])[k - 1]["t"] > 1.0]
         auto = find_cards(new_words, load_triggers(), total, not_before=2.9 if title else 0.0,
                           card_secs=card_secs, end_secs=end_sec) if auto_cards else []
-        off = [p for ph in o.get("cards_off") or [] for p in ph.split() if _norm(p)]
         auto = [x for x in auto if not any(same_word(x["word"], k) for k in off)]
         # автоматические картинки не ставим ближе 3 с к заданным вручную
         auto = [x for x in auto if all(abs(x["t"] - m["t"]) > 3 for m in manual)]
@@ -563,7 +704,12 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
     card_pos = o.get("card_pos") or st.get("card_pos", "top")
     if not o.get("card_pos") and st.get("align") == card_pos and card_pos in ("top", "bottom"):
         card_pos = "top" if card_pos == "bottom" else "bottom"  # субтитры перенесли туда, где картинки: картинки уходят на другой край
-    card_y = {"top": "200", "middle": "(H-h)/2", "bottom": "H-h-260"}[card_pos]
+    face = face_zone(src, segments, seek) if cards and not o.get("card_pos") else None
+    for c in cards:
+        c["pos"] = card_pos
+        if face:
+            c["pos"] = _free_spot(card_pos, face, Image.open(c["png"]).height, st)
+    card_ys = {"top": "200", "middle": "(H-h)/2", "bottom": "H-h-260"}
 
     ass_path = os.path.join(work, "subs.ass")
     with open(ass_path, "w", encoding="utf-8") as f:
@@ -590,7 +736,10 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
     for ph in o.get("zoom_words") or []:
         at = find_phrase(new_words, ph)
         if at:
-            punches.append((max(0.0, at[0] - 0.05), min(total, at[1] + 1.0), 1.45))
+            punches.append((max(0.0, at[0] - 0.05), min(total, at[1] + 1.0), 1.45, 1.45))
+    if o.get("zoom") != "off":
+        punches += _zoom_marks(new_words, o.get("zoom_marks"), total, strong=o.get("zoom") == "strong")
+    punches = _no_overlap(punches)
 
     inputs = (["-ss", f"{seek:.3f}"] if seek else []) + ["-i", src]
     for c in cards:
@@ -621,7 +770,7 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
     fc.append("".join(f"[v{i}][a{i}]" for i in range(len(segments))) + f"concat=n={len(segments)}:v=1:a=1[vc][ac]")
     base_zoom = {"off": 1.0, "strong": max(1.12, st["zoom"]) + 0.08}.get(o.get("zoom"), st["zoom"])
     colors = list(o.get("color") or [])
-    grade = "null" if "natural" in colors else st["grade"]
+    grade = "null" if "natural" in colors else (measured_grade(src, segments, seek) + st["grade"])
     grade += "".join("," + COLOR_FILTERS[c] for c in colors if c in COLOR_FILTERS)
     fc.append(
         f"[vc]{f'setpts=PTS/{speed},' if speed != 1.0 else ''}fps={FPS},"
@@ -653,7 +802,7 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
             f"[{i + 1}:v]format=rgba,fade=t=in:st=0:d=0.2:alpha=1,fade=t=out:st={dur - 0.25:.2f}:d=0.25:alpha=1,"
             f"setpts=PTS-STARTPTS+{t:.3f}/TB[c{i}]"
         )
-        fc.append(f"[{last}][c{i}]overlay=x=(W-w)/2:y={card_y}:eof_action=pass:enable='between(t,{t:.3f},{t + dur:.3f})'[o{i}]")
+        fc.append(f"[{last}][c{i}]overlay=x=(W-w)/2:y={card_ys[c['pos']]}:eof_action=pass:enable='between(t,{t:.3f},{t + dur:.3f})'[o{i}]")
         last = f"o{i}"
     end_at = total - end_sec if end_sec else total + 1
     ass_esc = ass_path.replace("\\", "/").replace(":", "\\:")
@@ -696,7 +845,8 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_path]
     subprocess.run(cmd, check=True)
     return {"segments": segments, "words": new_words, "cards": [c["t"] for c in cards], "duration": round(total, 2),
-            "cut_seconds": round(duration - total * speed, 2)}
+            "cut_seconds": round(duration - total * speed, 2), "speed": speed, "source_seconds": round(duration, 2),
+            "card_pos": [c["pos"] for c in cards], "face": face}
 
 
 def make_cover(video_path, title, out_path, at=0.8):

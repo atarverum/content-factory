@@ -5,7 +5,9 @@
 import asyncio
 import datetime as dt
 import glob
+import hashlib
 import html
+import json
 import logging
 import os
 import re
@@ -23,8 +25,8 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from aiohttp import web
 
-from . import captions, edits, instagram, library, store
-from .edit import make_cover, render
+from . import captions, director, edits, instagram, library, store
+from .edit import apply_plan, make_cover, render
 from .transcribe import load_or_transcribe, transcribe
 
 log = logging.getLogger("factory")
@@ -100,7 +102,10 @@ HELP = (
     "После монтажа правьте ролик текстом или голосом: «динамичнее и ярче», «субтитры снизу», "
     "«звук бум на слове „казнили“», «выложи завтра в 12». Свою картинку пришлите фото с подписью "
     "«на слово …», свою музыку пришлите mp3-файлом.\n\n"
-    "/edits все виды правок\n/plan очередь публикаций\n/stats статистика Instagram\n/style стиль по умолчанию: как у Полины, ночной или светлый\n"
+    "В рассказах и скетчах Claude читает расшифровку как сценарий: убирает дубли, оговорки и вводные, "
+    "ставит наезды и картинки, а перед отправкой сам проверяет кадры. Вернуть вырезанное: «оставь кусок про …», "
+    "всё заново: «смонтируй заново». Если одну правку просите в разных роликах, я предложу её запомнить.\n\n"
+    "/edits все виды правок\n/forget забыть запомненные настройки\n/plan очередь публикаций\n/stats статистика Instagram\n/style стиль по умолчанию: как у Полины, ночной или светлый\n"
     "/pause и /resume остановить или возобновить публикации\n/instagram подключить Instagram\n"
     "/invite код для второго человека"
 )
@@ -247,12 +252,16 @@ def _job_flag(j: dict, key: str, default):
     if j.get(key) is not None:
         return j[key]
     v = _genre(j)["job"].get(key)
+    if v is None:  # то, что автор попросил запомнить для всех роликов
+        v = (store.load().get("defaults") or {}).get(key)
     return default if v is None else v
 
 
 def _resolve_opts(j: dict) -> tuple[dict, list[str]]:
     """Настройки монтажа ролика с путями к звукам и эффектам (скачиваются при первой просьбе)."""
-    o = {**_genre(j)["opts"], **(j.get("opts") or {})}
+    # запомненное автором < настройки жанра < правки этого ролика
+    remembered = {k: v for k, v in (store.load().get("defaults") or {}).items() if k in edits.OPT_KEYS}
+    o = {**remembered, **_genre(j)["opts"], **(j.get("opts") or {})}
     warn = []
     snd = []
     for x in o.get("sounds") or []:
@@ -312,6 +321,27 @@ def _parse_hint(text: str | None) -> tuple[str | None, str | None]:
     return badge, "\n".join(rest).strip() or None
 
 
+def _wants_plan(j: dict, opts: dict) -> bool:
+    """Монтажный лист от Claude нужен там, где режем: рассказ и скетч; влог и «ничего не делай» идут целиком."""
+    return opts.get("cut") != "none" and captions._client() is not None
+
+
+def _plan_cards(plan: dict, words: list[dict], warn: list[str]) -> list[dict]:
+    """Картинки из монтажного листа: ищем в фотобанке и ставим на слово."""
+    have = {w["i"] for w in words}
+    out = []
+    for p in plan.get("pictures") or []:
+        if p["word"] not in have:
+            continue
+        try:
+            out.append({"word": p["word"], "image": library.image_file(p["query"])})
+        except Exception as e:
+            log.info("picture %s: %s", p["query"], e)
+    if plan.get("pictures") and not out:
+        warn.append("картинки из фотобанка не скачались")
+    return out
+
+
 def _build(job_id: str, new_caption: bool, hint: str | None = None):
     """Тяжёлая часть, выполняется в отдельном потоке."""
     j = store.load()["jobs"][job_id]
@@ -327,26 +357,64 @@ def _build(job_id: str, new_caption: bool, hint: str | None = None):
         cap = {}
     title = cap.get("title") or j.get("title")
     opts, warn = _resolve_opts(j)
-    extra = [c for c in j.get("extra_cards") or [] if os.path.exists(c["image"])] + _image_cards(j, words, warn)
+
+    # монтажный лист: что вырезать (дубли, оговорки), где наезды и картинки. Пишет Claude один раз на ролик,
+    # правки потом меняют лист. Без ключа листа нет, и дубли ищет прежнее правило.
+    plan = j.get("plan")
+    if plan is None and _wants_plan(j, opts):
+        plan = director.make_plan(words, j.get("genre") or "talk", j["style"], j.get("hint") or hint)
+        if plan:
+            store.update(lambda d: d["jobs"][job_id].__setitem__("plan", plan))
+        else:
+            warn.append("Claude не составил монтажный лист, дубли искала по простому правилу"
+                        + (f" ({captions.LAST_ERROR})" if captions.LAST_ERROR else ""))
+    use_plan = plan if plan and opts.get("cut") != "none" else None
+    cut_words = words
+    if use_plan:
+        cuts = [c for c in use_plan.get("cuts") or [] if not (opts.get("keep_retakes") and c["kind"] == "retake")]
+        cut_words = apply_plan(words, {"delete": [[c["from"], c["to"]] for c in cuts]})
+        opts["keep_retakes"] = True  # дубли уже выбрал Claude
+        opts["zoom_marks"] = use_plan.get("zooms") or []
+
     no_cards = _job_flag(j, "no_cards", False)
+    extra = [c for c in j.get("extra_cards") or [] if os.path.exists(c["image"])] + _image_cards(j, words, warn)
+    plan_pics = _plan_cards(use_plan, cut_words, warn) if use_plan and not no_cards else []
     if j.get("music") and not _music_file(True, j):
         warn.append("музыки пока нет: пришлите боту mp3-файл, и я поставлю его")
     tmp_out = f["out"] + ".tmp.mp4"
-    info = render(f["src"], words, tmp_out, style=j["style"], music=_music_file(j.get("music"), j),
-                  badge=j.get("badge"), title=title, workdir=f["dir"], cards=bool(extra) or not no_cards,
-                  auto_cards=not no_cards,  # во влоге свои картинки показываем, а автоматические нет
-                  accents=j.get("accents"), auto_accents=_job_flag(j, "auto_accents", True),
-                  extra_cards=extra,
-                  bright=bool(j.get("bright")), gentle=bool(j.get("gentle")), opts=opts)
+
+    def go(o):
+        return render(f["src"], cut_words, tmp_out, style=j["style"], music=_music_file(j.get("music"), j),
+                      badge=j.get("badge"), title=title, workdir=f["dir"], cards=bool(extra) or not no_cards,
+                      auto_cards=not no_cards and not plan_pics,  # во влоге свои картинки показываем, а автоматические нет
+                      accents=j.get("accents"), auto_accents=_job_flag(j, "auto_accents", True),
+                      extra_cards=extra + plan_pics,
+                      bright=bool(j.get("bright")), gentle=bool(j.get("gentle")), opts=o)
+    info = go(opts)
+
+    # самопроверка: Claude смотрит кадры у склеек и картинок; картинку на лице или на субтитрах переставляем
+    issues = director.self_check(tmp_out, info, f["dir"])
+    fixable = [x for x in issues if x["kind"] in ("card_on_face", "subs_under_card")]
+    if fixable and info.get("card_pos") and not opts.get("card_pos"):
+        cur = max(set(info["card_pos"]), key=info["card_pos"].count)
+        o2 = dict(opts, card_pos="top" if cur != "top" else "bottom")
+        info = go(o2)
+        issues = [x for x in director.self_check(tmp_out, info, f["dir"]) if x["kind"] in director.ISSUE_KINDS]
+    for x in issues:
+        warn.append(f"проверка: {director.ISSUE_KINDS.get(x['kind'], x['kind'])} на {x['t']:.0f} с"
+                    + (f" ({x['note']})" if x.get("note") else ""))
     os.replace(tmp_out, f["out"])
     _cover(j, f, title)
+    director.save_edl(f["dir"], j, use_plan, info)
+    line = director.plan_line(use_plan, info.get("source_seconds") or 0, info["duration"],
+                              zooms=opts.get("zoom") != "off", pictures=len(plan_pics))
 
     def put(d):
         d["jobs"][job_id].update(cap)
         # ролик, стоявший в очереди, после правки остаётся в очереди
         status = "scheduled" if d["jobs"][job_id].get("publish_at") else "review"
         d["jobs"][job_id].update({"status": status, "duration": info["duration"],
-                                  "cut_seconds": info["cut_seconds"], "warnings": warn})
+                                  "cut_seconds": info["cut_seconds"], "warnings": warn, "plan_line": line})
     store.update(put)
 
 
@@ -387,8 +455,8 @@ async def _send_preview(chat_id: int, job_id: str):
     # без размеров Telegram иногда показывает вертикальный ролик квадратом
     await bot.send_video(chat_id, FSInputFile(f["out"]), cover=FSInputFile(f["cover"]),
                          supports_streaming=True, width=1080, height=1920, duration=int(round(j.get("duration") or 0)) or None,
-                         caption=f"{_genre(j)['name']} · {STYLE_NAMES[j['style']]} стиль · {j['duration']:.0f} с · "
-                                 f"вырезано {j['cut_seconds']:.0f} с пауз и оговорок")
+                         caption=f"{_genre(j)['name']} · {STYLE_NAMES[j['style']]} стиль · "
+                                 + (j.get("plan_line") or f"{j['duration']:.0f} с, вырезано {j['cut_seconds']:.0f} с пауз и оговорок"))
     text = (f"<b>{html.escape(j['title'])}</b>\n\n{html.escape(captions.full_caption(j))}")
     if j.get("caption_source") == "template":
         text += "\n\n<i>Подпись по шаблону: ключ Claude не подключён.</i>"
@@ -430,12 +498,14 @@ async def on_video(m: Message):
     job = {"id": job_id, "chat_id": m.chat.id, "status": "processing", "style": store.load()["style"],
            "badge": badge, "music": bool(_music_file(True)), "removed": [], "key": secrets.token_urlsafe(12),
            "created": time.time()}
+    if "music" in (store.load().get("defaults") or {}):  # автор попросил запомнить «без музыки» / «с музыкой»
+        job["music"] = bool(store.load()["defaults"]["music"]) and job["music"]
+    job["hint"] = hint
     genre = next((g for g, pat in edits.GENRE_WORDS if hint and re.search(pat, hint.lower())), None)
     if genre:
         job["genre"] = genre
     else:
         job["status"] = "waiting"
-        job["hint"] = hint
     store.update(lambda d: d["jobs"].__setitem__(job_id, job))
     if not genre:
         await m.answer(GENRE_QUESTION, reply_markup=_genre_kb(job_id))
@@ -463,6 +533,76 @@ def _fmt_time(ts: float) -> str:
               "сентября", "октября", "ноября", "декабря"]
     t = dt.datetime.fromtimestamp(ts, MSK)
     return f"{t.day} {months[t.month - 1]} в {t:%H:%M}"
+
+
+# ───────────────────────── память стиля ─────────────────────────
+# Если одну и ту же правку просят в разных роликах, бот предлагает запомнить её для всех следующих.
+HABIT_OPT_KEYS = ["cut", "speed", "zoom", "color", "sub_size", "sub_pos", "sub_case", "sub_color", "sub_font", "sub_words",
+                  "card_scale", "card_pos", "card_secs", "music_vol", "voice_vol", "denoise", "end_card", "title_on"]
+HABIT_JOB_KEYS = ["music", "no_cards", "auto_accents", "cta"]
+
+
+def _habits(job_id: str, e: dict) -> list[tuple[str, str]]:
+    """Отметить правку; вернуть [(id, текст)] привычек, которые пора предложить запомнить (2+ разных ролика)."""
+    offer = []
+
+    def upd(d):
+        hs = d.setdefault("habits", {})
+        for k in HABIT_OPT_KEYS + HABIT_JOB_KEYS:
+            v = e.get(k)
+            if v is None or k in (d.get("defaults") or {}) and d["defaults"][k] == v:
+                continue
+            one = edits.new_edit()
+            one[k] = v
+            text = "; ".join(edits.summary(one))
+            if not text:
+                continue
+            hid = hashlib.sha1(json.dumps([k, v], ensure_ascii=False).encode()).hexdigest()[:10]
+            h = hs.setdefault(hid, {"key": k, "value": v, "text": text, "jobs": [], "state": None})
+            if job_id not in h["jobs"]:
+                h["jobs"].append(job_id)
+            if len(h["jobs"]) >= 2 and h["state"] is None:
+                h["state"] = "offered"
+                offer.append((hid, text))
+    store.update(upd)
+    return offer
+
+
+@dp.callback_query(F.data.startswith("rem:") | F.data.startswith("nrem:"))
+async def on_remember(cq: CallbackQuery):
+    if not _allowed(cq.from_user.id):
+        await cq.answer()
+        return
+    action, hid = cq.data.split(":", 1)
+    h = store.load().get("habits", {}).get(hid)
+    await cq.answer()
+    await cq.message.edit_reply_markup(reply_markup=None)
+    if not h:
+        return
+    if action == "nrem":
+        store.update(lambda d: d["habits"][hid].__setitem__("state", "no"))
+        await cq.message.answer("Хорошо, не запоминаю.")
+        return
+
+    def save(d):
+        d["habits"][hid]["state"] = "saved"
+        d.setdefault("defaults", {})[h["key"]] = h["value"]
+    store.update(save)
+    director.remember(f"Всегда: {h['text']}.")
+    await cq.message.answer(f"Запомнила: {html.escape(h['text'])} — во всех следующих роликах. "
+                            "Забыть всё запомненное: /forget")
+
+
+@dp.message(Command("forget"))
+async def cmd_forget(m: Message):
+    if not _allowed(m.from_user.id):
+        return
+    store.update(lambda d: (d.__setitem__("defaults", {}), d.__setitem__("habits", {})))
+    try:
+        os.remove(director.notes_path())
+    except FileNotFoundError:
+        pass
+    await m.answer("Забыла все запомненные настройки: новые ролики будут монтироваться по исходному стилю.")
 
 
 @dp.callback_query(F.data.contains(":"))
@@ -647,6 +787,13 @@ async def on_text(m: Message):
                        f"(причина: {html.escape(e['fallback'][:200])}).")
     flags = {}
     store.update(lambda d: flags.update(edits.apply(d["jobs"][job_id], e)))
+    if e.get("restore_phrases") and j.get("plan"):
+        # «оставь кусок про Якова»: убираем вырезку из монтажного листа
+        indexed = [dict(w, i=k) for k, w in enumerate(load_or_transcribe(f["src"], f["words"]))]
+        plan = j["plan"]
+        if director.restore(plan, indexed, e["restore_phrases"]):
+            store.update(lambda d: d["jobs"][job_id].__setitem__("plan", plan))
+            flags["render"] = True
 
     said = edits.summary(e)
     if j["status"] == "waiting":
@@ -685,6 +832,12 @@ async def on_text(m: Message):
         await _send_preview(m.chat.id, job_id)
     if flags["publish"] and store.load()["jobs"][job_id]["status"] != "failed":
         await _do_action(m.chat.id, job_id, flags["publish"], flags.get("when"))
+    for hid, text in _habits(job_id, e):
+        b = InlineKeyboardButton
+        await m.answer(f"Вы уже не в первый раз просите: {html.escape(text)}. Запомнить для всех следующих роликов?",
+                       reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                           b(text="📌 Запомнить", callback_data=f"rem:{hid}"),
+                           b(text="Не надо", callback_data=f"nrem:{hid}")]]))
 
 
 # ───────────────────────── публикация по расписанию ─────────────────────────

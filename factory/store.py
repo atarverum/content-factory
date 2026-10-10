@@ -14,6 +14,8 @@ _DEFAULT = {
     "jobs": {},             # id → задание
     "secrets": {},          # meta_app_id, meta_app_secret, ig_token, ig_user_id, ig_token_expires
     "paused": False,
+    "defaults": {},         # что автор попросил запомнить для всех роликов (ключ правки → значение)
+    "habits": {},           # повторяющиеся правки: предложить запомнить
 }
 
 
