@@ -286,8 +286,8 @@ EOF
       echo "Скачайте его на Mac командой (на Mac): scp root@$IP:$OUT ~/Downloads/"
       exit 0 ;;
     auto)
-      # Подписка для Happ с автопереключением: два входа XHTTP (порты 443 и 8443). Happ
-      # проверяет (раз в 30 секунд), жив ли основной вход 8443, и если нет, идёт через 443. Русские сайты идут напрямую.
+      # Подписка для Happ (JSON): вход XHTTP 8443, русские сайты напрямую. Обновляется в Happ сама,
+      # так что новые входы (например, мост в России) появятся у всех без переустановки.
       [ "$PORT" = 443 ] || die "сначала: bash install-vpn.sh move443"
       grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
       # shellcheck disable=SC1090
@@ -327,23 +327,18 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
                         "publicKey": pub, "shortId": sid}}}
     conf = {
         "remarks": "🇳🇱 Raido NL",
-        "dns": {"servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
-                "queryStrategy": "UseIPv4"},
         "inbounds": [
             {"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
              "settings": {"auth": "noauth", "udp": True}, "sniffing": sniff},
             {"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http",
              "settings": {}, "sniffing": sniff}],
-        "outbounds": [out("vpn-443", 443), out("vpn-8443", 8443),
+        # Один вход 8443: 443 у Александра провайдер душит, а пустая проверка входов на iPhone
+        # тормозила старт (при неудачной первой проверке телефон уходил на 443). Резервом станет мост в России.
+        "outbounds": [out("vpn-8443", 8443),
                       {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
                       {"tag": "block", "protocol": "blackhole"}],
-        "observatory": {"subjectSelector": ["vpn-"], "probeURL": "https://www.google.com/generate_204",
-                        "probeInterval": "30s", "enableConcurrency": True},
         # Без geoip/geosite: на iPhone у VPN всего 50 МБ памяти, а эти базы съедают ~20 МБ и тормозят запуск.
         "routing": {"domainStrategy": "AsIs",
-            # Основной вход 8443 (проверен у Александра), 443 включается, только если 8443 не ответил на проверку.
-            "balancers": [{"tag": "auto", "selector": ["vpn-8443"], "strategy": {"type": "leastPing"},
-                           "fallbackTag": "vpn-443"}],
             "rules": [
                 {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
                                          "169.254.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10", ip],
@@ -355,7 +350,7 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
                  "outboundTag": "direct"},
                 # QUIC (HTTP/3) через туннель тормозит: браузер сразу уходит на обычный HTTPS.
                 {"type": "field", "network": "udp", "port": "443", "outboundTag": "block"},
-                {"type": "field", "network": "tcp,udp", "balancerTag": "auto"}]}}
+                {"type": "field", "network": "tcp,udp", "outboundTag": "vpn-8443"}]}}
     with open("/etc/xray-sub/" + token, "w") as f:
         json.dump(conf, f, ensure_ascii=False, indent=2)
     print(token, name)
