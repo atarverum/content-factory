@@ -72,15 +72,20 @@ CUTS = {  # насколько плотно режем: (самая длинна
     "tight": (0.25, 0.05, 0.10),     # «короче», «динамичнее»
     "normal": (MAX_GAP, PAD_BEFORE, PAD_AFTER),
     "gentle": (1.5, 0.3, 0.5),       # «подлиннее», «оставь паузы»
+    "none": None,                    # не резать вообще: влог, зарисовка, «от начала до конца»
 }
 
 
 def plan_cuts(words, duration, gentle=False, cut=None, keep_retakes=False):
     """Возвращает (отрезки исходника [(start, end)], слова в новом времени).
 
-    cut: tight / normal / gentle (см. CUTS); gentle=True — то же, что cut="gentle".
-    keep_retakes: не выбрасывать повторные дубли."""
-    max_gap, pad_before, pad_after = CUTS[cut or ("gentle" if gentle else "normal")]
+    cut: tight / normal / gentle / none (см. CUTS); gentle=True — то же, что cut="gentle".
+    keep_retakes: не выбрасывать повторные дубли.
+    Слово с пометкой "nocut" не отрезаем от следующего: паузу после него оставляем (плавная склейка)."""
+    cut = cut or ("gentle" if gentle else "normal")
+    if cut == "none":
+        return [(0.0, duration)], [dict(w, seg=0) for w in words if w["start"] < duration]
+    max_gap, pad_before, pad_after = CUTS[cut]
     words = [w for w in words if _norm(w["word"]) not in FILLERS]
     if not keep_retakes:
         words = [w for ph in _drop_retakes(_phrases(words)) for w in ph]
@@ -89,7 +94,7 @@ def plan_cuts(words, duration, gentle=False, cut=None, keep_retakes=False):
 
     groups, cur = [], [words[0]]
     for w in words[1:]:
-        if w["start"] - cur[-1]["end"] > max_gap:
+        if w["start"] - cur[-1]["end"] > max_gap and not cur[-1].get("nocut"):
             groups.append(cur)
             cur = []
         cur.append(w)
@@ -164,6 +169,20 @@ def find_phrase(words, phrase):
         if n and all(same_word(words[i + k]["word"], target[k]) for k in range(n)):
             return words[i]["start"], words[i + n - 1]["end"]
     return None
+
+
+def mark_smooth(words, phrases):
+    """«После слов X резкая склейка» — помечаем последнее слово фразы, паузу после него не вырезаем."""
+    out = [dict(w) for w in words]
+    for ph in phrases or []:
+        target = [t for t in ph.split() if _norm(t)]
+        n = len(target)
+        for i in range(len(out) - n + 1):
+            if n and all(same_word(out[i + k]["word"], target[k]) for k in range(n)):
+                out[i + n - 1]["nocut"] = True
+                if i + n < len(out):  # и пауза перед следующей фразой тоже остаётся
+                    out[i + n]["nocut_before"] = True
+    return out
 
 
 def apply_fixes(words, fixes):
@@ -395,6 +414,9 @@ SUB_COLORS = {"red": "#C8102E", "gold": "#CFA85F", "yellow": "#F5D547", "white":
               "pink": "#FB7D7E", "indigo": "#2B1E7A", "purple": "#8E5BD9", "green": "#1E3527", "orange": "#E2653A",
               "paper": "#F3EDE3", "night": "#15122A"}
 SUB_POS = {"top": ("top", 205), "middle": ("middle", 0), "bottom": ("bottom", 380)}
+# шрифты из assets/fonts (все с кириллицей); имя — как его знает libass
+SUB_FONTS = ["Jost", "Oranienbaum", "Montserrat", "Rubik", "Comfortaa", "Russo One", "Unbounded", "Playfair Display",
+             "Caveat", "Marck Script", "Lobster", "Pacifico", "Amatic SC"]
 
 
 def style_with(style, opts):
@@ -420,8 +442,17 @@ def style_with(style, opts):
             st["text"] = col
             if col.upper() in ("#FFFFFF", "#F3EDE3", "#F5D547") and not st["outline_px"]:
                 st["outline_px"] = 3  # светлый текст без обводки не читается на светлом фоне
-    if opts.get("sub_font") in ("Jost", "Oranienbaum"):
+    if opts.get("sub_font") in SUB_FONTS:
         st["font"] = opts["sub_font"]
+    shift = int(opts.get("sub_shift") or 0)  # «выше» — плюс, «ниже» — минус, в пикселях
+    if shift:
+        align = st.get("align", "bottom")
+        if align == "middle":  # от центра: переводим в отсчёт снизу
+            st["align"], st["margin_v"] = "bottom", H // 2 - st["font_size"] // 2
+            align = "bottom"
+        mv = st.get("margin_v", 560)
+        mv = mv - shift if align == "top" else mv + shift
+        st["margin_v"] = max(40, min(H - 200, mv))
     if opts.get("sub_words"):
         n = max(1, min(5, int(opts["sub_words"])))
         st["max_words"], st["max_chars"] = n, 7 + 7 * n
@@ -463,6 +494,7 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
     st = style_with(style, o)
     words = [dict(w, i=w.get("i", k)) for k, w in enumerate(words)]
     words = apply_fixes(words, o.get("fixes"))
+    words = mark_smooth(words, o.get("smooth"))
     words = mark_accents(words, accents, auto_accents)
     work = workdir or tempfile.mkdtemp(prefix="factory_")
     os.makedirs(work, exist_ok=True)
@@ -484,7 +516,7 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
     total = sum(seg_durs)
     show_end = o["end_card"] if o.get("end_card") is not None else (end_card and st.get("end_card", True))
     end_sec = END_SECONDS if show_end else 0.0
-    if o.get("title_on") is False:
+    if o.get("title_on") is False or (o.get("title_on") is None and not st.get("title_on", True)):
         title = None
 
     card_secs = float(o.get("card_secs") or CARD_SECONDS)

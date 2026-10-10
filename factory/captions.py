@@ -52,16 +52,19 @@ def _edit_schema() -> dict:
         return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
 
     pos = ["top", "middle", "bottom"]
+    from .edit import SUB_FONTS
     props = {
-        "cut": nul("string", ["tight", "normal", "gentle"]), "keep_retakes": nul("boolean"),
+        "genre": nul("string", list(edits.GENRES)), "minimal": nul("boolean"),
+        "cut": nul("string", ["tight", "normal", "gentle", "none"]), "smooth": arr({"type": "string"}),
+        "keep_retakes": nul("boolean"),
         "trim_start": nul("number"), "trim_end": nul("number"),
         "remove_phrases": arr({"type": "string"}), "restore_phrases": arr({"type": "string"}),
         "speed": nul("number"), "zoom": nul("string", ["off", "normal", "strong"]),
         "zoom_words": arr({"type": "string"}), "mirror": nul("boolean"),
         "color": {"type": ["array", "null"], "items": {"type": "string", "enum": list(edits.LOOK_NAMES)}},
-        "subs": nul("boolean"), "sub_size": nul("number"), "sub_pos": nul("string", pos),
+        "subs": nul("boolean"), "sub_size": nul("number"), "sub_pos": nul("string", pos), "sub_shift": nul("integer"),
         "sub_case": nul("string", ["upper", "lower", "normal"]), "sub_color": nul("string", list(edits.COLOR_NAMES)),
-        "sub_font": nul("string", ["Jost", "Oranienbaum"]), "sub_words": nul("integer"),
+        "sub_font": nul("string", SUB_FONTS), "sub_words": nul("integer"),
         "fixes": arr(obj({"from": {"type": "string"}, "to": {"type": "string"}})),
         "accents": arr(obj({"phrase": {"type": "string"},
                             "color": nul("string", ["red", "gold", "indigo", "green", "orange", "paper", "night"]),
@@ -76,7 +79,7 @@ def _edit_schema() -> dict:
                                                  "removed", "color"]}),
         "style": nul("string", ["polina", "night", "paper"]), "title": nul("string"), "title_on": nul("boolean"),
         "badge": nul("string"), "end_card": nul("boolean"),
-        "caption": nul("string"), "recaption": nul("boolean"),
+        "caption": nul("string"), "recaption": nul("boolean"), "cta": nul("boolean"),
         "hashtags_add": arr({"type": "string"}), "hashtags_remove": arr({"type": "string"}),
         "cover_text": nul("string"), "cover_at": nul("number"),
         "publish": nul("string", ["queue", "now", "archive", "cancel"]), "publish_when": nul("string"),
@@ -139,43 +142,62 @@ _TOPIC_TAGS = [
 ]
 
 
-def _topic_tags(text: str, hint: str = "") -> list[str]:
-    """Хештеги по словам ролика и пожеланию Полины. Части пожелания с «убери», «не про» и т. п. пропускаем."""
+def _topic_tags(text: str, hint: str = "", genre: str | None = None) -> list[str]:
+    """Хештеги по словам ролика и пожеланию. Темы из частей пожелания с «убери», «не про» и т. п. не ставим вовсе."""
     norm = lambda x: x.lower().replace("ё", "е")
-    clauses = [c for c in re.split(r"[.,;!?]|\bно\b|\bа\b", norm(hint))
-               if not any(x in c for x in ("убер", "не из", "не про", "без ", "не надо", "не ну"))]
-    t = norm(text) + " " + " ".join(clauses)
+    neg = ("убер", "убр", "не из", "не про", "без ", "не надо", "не ну")
+    clauses = re.split(r"[.,;!?]|\bно\b|\bа\b", norm(hint))
+    banned = {i for i, (keys, _) in enumerate(_TOPIC_TAGS)
+              for c in clauses if any(x in c for x in neg) and any(k in c for k in keys)}
+    t = norm(text) + " " + " ".join(c for c in clauses if not any(x in c for x in neg))
     tags = []
-    for keys, add in _TOPIC_TAGS:
-        if any(k in t for k in keys):
+    for i, (keys, add) in enumerate(_TOPIC_TAGS):
+        if i not in banned and any(k in t for k in keys):
             tags += [h for h in add if h not in tags]
-    tags += [h for h in ["#эзотерика", "#icon_witch"] if h not in tags]
+    base = {"vlog": ["#влог", "#icon_witch"], "sketch": ["#юмор", "#icon_witch"]}.get(genre, ["#эзотерика", "#icon_witch"])
+    tags += [h for h in base if h not in tags]
     return tags[:8]
 
 
-def _template(text: str, badge: str | None, hint: str | None = None) -> dict:
-    first = re.split(r"(?<=[.!?])\s+", text.strip())[0] if text.strip() else "Новое видео"
+def _template(text: str, badge: str | None, hint: str | None = None, cta: bool = True, genre: str | None = None) -> dict:
+    sentences = [x for x in re.split(r"(?<=[.!?])\s+", text.strip()) if x]
+    first = sentences[0] if sentences else ""
     title_words = re.sub(r"[^\w\s-]", "", first).split()[:5]
     title = " ".join(title_words).capitalize() or "Новое видео"
-    lead = f"{badge}. " if badge else ""
-    caption = (
-        f"{lead}{first}\n\n"
-        "Сохраните, чтобы не потерять ✨\n"
-        "Больше в Telegram, ссылка в профиле."
-    )
+    # одна-две случайные фразы из влога — не подпись; тогда подпись короткая
+    lead = first if len(first.split()) >= 4 else ""
+    if badge:
+        lead = f"{badge}. {lead}".strip()
+    parts = [lead] if lead else []
+    if cta:
+        parts.append("Сохраните, чтобы не потерять ✨\nБольше в Telegram, ссылка в профиле.")
+    caption = "\n\n".join(parts) or "✨"
     return {
         "title": title,
         "caption": caption,
-        "hashtags": _topic_tags(text + " " + (badge or ""), hint or ""),
+        "hashtags": _topic_tags(text + " " + (badge or ""), hint or "", genre),
         "rubric": "",
         "source": "template",
     }
 
 
-def make_caption(words: list[dict], badge: str | None = None, hint: str | None = None) -> dict:
+GENRE_HINTS = {
+    "talk": "Жанр: рассказ Полины (просвещение, религии, история, эзотерика).",
+    "vlog": "Жанр: влог, зарисовка из путешествия или повседневной жизни. Пиши легко и коротко, как личный пост, "
+            "без эзотерики, если её нет в ролике.",
+    "sketch": "Жанр: короткий комедийный скетч. Подпись короткая и смешная, без серьёзных пояснений.",
+}
+
+
+def make_caption(words: list[dict], badge: str | None = None, hint: str | None = None, cta: bool = True,
+                 genre: str | None = None) -> dict:
     """{"title", "caption", "hashtags", "rubric", "source"} по расшифровке ролика."""
     text = transcript_text(words)
     user = f"Расшифровка ролика:\n{text}\n"
+    if genre in GENRE_HINTS:
+        user += f"\n{GENRE_HINTS[genre]}\n"
+    if not cta:
+        user += "\nБез призыва перейти в Telegram и без ссылок.\n"
     if badge:
         user += f"\nПлашка ролика: {badge}\n"
     if hint:
@@ -183,7 +205,7 @@ def make_caption(words: list[dict], badge: str | None = None, hint: str | None =
     user += "\nПридумай заголовок на обложку, подпись, хештеги и рубрику (одним-двумя словами)."
     res = _ask(STYLE_GUIDE, user, _CAPTION_SCHEMA)
     if not res:
-        return _template(text, badge, hint)
+        return _template(text, badge, hint, cta, genre)
     res["hashtags"] = [h if h.startswith("#") else "#" + h for h in res["hashtags"]]
     res["source"] = "claude"
     return res
@@ -198,8 +220,13 @@ _EDIT_SYSTEM = """Полина или Александр присылают пр
 Поля, которые правка не затрагивает: null, списки пустые. Числа пиши итоговые, с учётом текущих настроек ролика
 («ещё крупнее» при sub_size 1.2 → 1.44).
 
+Жанр. genre: talk — рассказ Полины (религии, история, эзотерика: нарезка, картинки, выделения), vlog — влог,
+путешествие, зарисовка, повседневность (ролик целиком, без вырезаний и картинок, только субтитры), sketch —
+комедийный скетч (плотная нарезка, без картинок). Ставь, если из правки понятно, что это за ролик.
+minimal: true, если просят «больше ничего не делай», «только субтитры» — ролик целиком, только субтитры и цвет.
 Нарезка. cut: tight («короче», «динамичнее», «убери все паузы»), gentle («подлиннее», «оставь паузы»,
-«не режь так сильно»), normal (как обычно). keep_retakes: true — оставить повторные дубли.
+«не режь так сильно»), normal (как обычно), none («от начала до конца», «ничего не вырезай», «целиком»).
+smooth: фразы из расшифровки, после которых склейка резкая и паузу нужно оставить («после слов … перемонтируй»). keep_retakes: true — оставить повторные дубли.
 trim_start / trim_end: сколько секунд срезать в начале / в конце готового ролика («начни с 3 секунды» → 3).
 remove_phrases: точные куски речи из расшифровки, которые вырезать («вырежи, где я про погоду» → вся эта фраза
 из расшифровки дословно). restore_phrases: вернуть вырезанное раньше.
@@ -209,9 +236,13 @@ remove_phrases: точные куски речи из расшифровки, к
 Цвет. color — полный новый список поверх цвета стиля: bright (ярче, сочнее, подкрасить), light (светлее),
 dark (темнее), warm (теплее), cold (холоднее), muted (приглушённее), contrast (контрастнее), bw (весь ролик
 чёрно-белым), natural (без цветокоррекции, как снято). «Цвет как было» → []. Учитывай текущий список.
-Субтитры. subs: false — убрать, true — вернуть. sub_size: множитель размера. sub_pos: top/middle/bottom.
-sub_case: upper (заглавными), lower (строчными), normal. sub_color: цвет текста. sub_font: Oranienbaum
-(красивый, с засечками), Jost (простой). sub_words: сколько слов на экране сразу (1–4).
+Субтитры. subs: false — убрать, true — вернуть или наложить. sub_size: множитель размера. sub_pos: top/middle/bottom.
+sub_shift: сдвиг в пикселях от текущего места, итоговый (выше +150, чуть выше +70, ниже −150).
+«Чтобы субтитры были одни» — значит второй строкой мешает заголовок: title_on false.
+sub_case: upper (заглавными), lower (строчными), normal. sub_color: цвет текста. sub_font: Jost (простой, как
+у Полины), Oranienbaum (старинный с засечками), Montserrat (современный жирный), Rubik (округлый), Comfortaa (мягкий),
+Russo One (спортивный), Unbounded (широкий модный), Playfair Display (элегантный журнальный), Caveat (рукописный),
+Marck Script (каллиграфия), Lobster (ретро), Pacifico (летний), Amatic SC (тонкий рукописный). sub_words: сколько слов на экране сразу (1–4).
 fixes: исправить написание слова в субтитрах (from — как в расшифровке, to — как надо).
 accents: выделить слова в субтитрах цветом/шрифтом; auto_accents: false — не выделять автоматически.
 Картинки. no_cards: true — без картинок, false — вернуть. cards_off: слова, на которых убрать картинку.
@@ -223,7 +254,8 @@ sounds: звуковой эффект на фразе из расшифровк�
 ролика, title_on: показывать ли заголовок. badge: текст плашки ("" — убрать плашку). end_card: финальная заставка.
 Подпись к посту. Если просят изменить подпись, сразу напиши новую в caption (по теме ролика, её пожеланию и
 правилам ниже) и полный список хештегов в её конце не ставь — хештеги отдельно: hashtags_add / hashtags_remove.
-recaption: true только если подпись нужно переписать, а ты её не написал.
+recaption: true только если подпись нужно переписать, а ты её не написал. cta: false — без призыва и ссылки на
+Telegram, true — с ним.
 Обложка. cover_text: текст на обложке; cover_at: с какой секунды готового ролика взять кадр.
 Публикация. publish: queue (в очередь на ближайший вечер), now (выложить сейчас), archive, cancel (снять с очереди).
 publish_when: «ГГГГ-ММ-ДД ЧЧ:ММ» по Москве, если назвали время.

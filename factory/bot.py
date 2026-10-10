@@ -8,6 +8,7 @@ import glob
 import html
 import logging
 import os
+import re
 import secrets
 import time
 import uuid
@@ -35,7 +36,7 @@ PUBLISH_TIME = os.environ.get("PUBLISH_TIME", "19:00")
 WEB_PORT = int(os.environ.get("WEB_PORT", "8080"))
 MUSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "music")
 STYLE_NAMES = {"polina": "как у Полины", "night": "ночной", "paper": "светлый"}
-STATUS_NAMES = {"processing": "монтируется", "review": "ждёт решения", "scheduled": "в очереди",
+STATUS_NAMES = {"waiting": "ждёт выбора жанра", "processing": "монтируется", "review": "ждёт решения", "scheduled": "в очереди",
                 "publishing": "публикуется", "published": "опубликован", "archived": "в архиве",
                 "failed": "ошибка"}
 
@@ -91,8 +92,9 @@ async def cmd_invite(m: Message):
 
 
 HELP = (
-    "Пришлите видео (вертикальное, со звуком). Я смонтирую его: вырежу паузы и оговорки, "
-    "добавлю зумы, картинки, субтитры, обложку и подпись, и пришлю вам на проверку.\n\n"
+    "Пришлите видео (вертикальное, со звуком). Я спрошу, что это за ролик: рассказ (нарезка, картинки, "
+    "выделения), влог или зарисовка (ролик целиком, только субтитры и цвет) или скетч (плотная нарезка), "
+    "смонтирую и пришлю на проверку. Жанр можно сразу написать в подписи к видео: «влог», «скетч».\n\n"
     "В подписи к видео можно написать пожелание, например «плашка: 14-е лунные сутки» "
     "или «тема: руны на неделю».\n\n"
     "После монтажа правьте ролик текстом или голосом: «динамичнее и ярче», «субтитры снизу», "
@@ -236,9 +238,21 @@ def _music_file(on: bool, job: dict | None = None):
     return files[0] if files else None
 
 
+def _genre(j: dict) -> dict:
+    return edits.GENRES.get(j.get("genre") or "talk", edits.GENRES["talk"])
+
+
+def _job_flag(j: dict, key: str, default):
+    """Настройка ролика: правка Полины, иначе жанр, иначе default."""
+    if j.get(key) is not None:
+        return j[key]
+    v = _genre(j)["job"].get(key)
+    return default if v is None else v
+
+
 def _resolve_opts(j: dict) -> tuple[dict, list[str]]:
     """Настройки монтажа ролика с путями к звукам и эффектам (скачиваются при первой просьбе)."""
-    o = dict(j.get("opts") or {})
+    o = {**_genre(j)["opts"], **(j.get("opts") or {})}
     warn = []
     snd = []
     for x in o.get("sounds") or []:
@@ -286,7 +300,7 @@ def _build(job_id: str, new_caption: bool, hint: str | None = None):
     words = load_or_transcribe(f["src"], f["words"])
     words = captions.remove_phrases(words, j.get("removed", []))
     if new_caption or not j.get("caption"):
-        c = captions.make_caption(words, j.get("badge"), hint)
+        c = captions.make_caption(words, j.get("badge"), hint, cta=_job_flag(j, "cta", True), genre=j.get("genre"))
         cap = {"title": j.get("title_override") or c["title"], "caption": c["caption"],
                "hashtags": c["hashtags"], "rubric": c.get("rubric", ""), "caption_source": c["source"]}
     else:
@@ -297,8 +311,8 @@ def _build(job_id: str, new_caption: bool, hint: str | None = None):
         warn.append("музыки пока нет: пришлите боту mp3-файл, и я поставлю его")
     tmp_out = f["out"] + ".tmp.mp4"
     info = render(f["src"], words, tmp_out, style=j["style"], music=_music_file(j.get("music"), j),
-                  badge=j.get("badge"), title=title, workdir=f["dir"], cards=not j.get("no_cards"),
-                  accents=j.get("accents"), auto_accents=j.get("auto_accents", True),
+                  badge=j.get("badge"), title=title, workdir=f["dir"], cards=not _job_flag(j, "no_cards", False),
+                  accents=j.get("accents"), auto_accents=_job_flag(j, "auto_accents", True),
                   extra_cards=[c for c in j.get("extra_cards") or [] if os.path.exists(c["image"])],
                   bright=bool(j.get("bright")), gentle=bool(j.get("gentle")), opts=opts)
     os.replace(tmp_out, f["out"])
@@ -326,8 +340,22 @@ def _kb(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [b(text="✅ В очередь", callback_data=f"q:{job_id}"), b(text="⚡ Выложить сейчас", callback_data=f"now:{job_id}")],
         [b(text="✏️ Поправить", callback_data=f"ed:{job_id}"), b(text="🎨 Другой стиль", callback_data=f"st:{job_id}")],
-        [b(text="🗂 В архив", callback_data=f"ar:{job_id}")],
+        [b(text="🎭 Другой жанр", callback_data=f"gq:{job_id}"), b(text="🗂 В архив", callback_data=f"ar:{job_id}")],
     ])
+
+
+def _genre_kb(job_id: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardButton
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [b(text="🎓 Рассказ", callback_data=f"g:talk:{job_id}")],
+        [b(text="✈️ Влог, путешествие, зарисовка", callback_data=f"g:vlog:{job_id}")],
+        [b(text="😂 Скетч, комедия", callback_data=f"g:sketch:{job_id}")],
+    ])
+
+
+GENRE_QUESTION = ("Что это за ролик?\n🎓 Рассказ: монтирую как ролики Полины про религии и историю, "
+                  "с нарезкой, картинками и выделениями.\n✈️ Влог: ролик целиком, без вырезаний и картинок, "
+                  "только субтитры и цвет.\n😂 Скетч: плотная нарезка, без картинок.")
 
 
 async def _send_preview(chat_id: int, job_id: str):
@@ -335,7 +363,7 @@ async def _send_preview(chat_id: int, job_id: str):
     f = _job_files(job_id)
     await bot.send_video(chat_id, FSInputFile(f["out"]), cover=FSInputFile(f["cover"]),
                          supports_streaming=True,
-                         caption=f"{STYLE_NAMES[j['style']]} стиль · {j['duration']:.0f} с · "
+                         caption=f"{_genre(j)['name']} · {STYLE_NAMES[j['style']]} стиль · {j['duration']:.0f} с · "
                                  f"вырезано {j['cut_seconds']:.0f} с пауз и оговорок")
     text = (f"<b>{html.escape(j['title'])}</b>\n\n{html.escape(captions.full_caption(j))}")
     if j.get("caption_source") == "template":
@@ -378,7 +406,16 @@ async def on_video(m: Message):
     job = {"id": job_id, "chat_id": m.chat.id, "status": "processing", "style": store.load()["style"],
            "badge": badge, "music": bool(_music_file(True)), "removed": [], "key": secrets.token_urlsafe(12),
            "created": time.time()}
+    genre = next((g for g, pat in edits.GENRE_WORDS if hint and re.search(pat, hint.lower())), None)
+    if genre:
+        job["genre"] = genre
+    else:
+        job["status"] = "waiting"
+        job["hint"] = hint
     store.update(lambda d: d["jobs"].__setitem__(job_id, job))
+    if not genre:
+        await m.answer(GENRE_QUESTION, reply_markup=_genre_kb(job_id))
+        return
     await _process(m.chat.id, job_id, new_caption=True, hint=hint)
 
 
@@ -410,6 +447,9 @@ async def on_button(cq: CallbackQuery):
         await cq.answer()
         return
     action, job_id = cq.data.split(":", 1)
+    genre = None
+    if action == "g":
+        genre, job_id = job_id.split(":", 1)
     j = store.load()["jobs"].get(job_id)
     if not j:
         await cq.answer("Ролик не найден")
@@ -420,7 +460,23 @@ async def on_button(cq: CallbackQuery):
     await cq.answer()
     await cq.message.edit_reply_markup(reply_markup=None)
 
-    if action == "ed":
+    if action == "g":
+        first = j["status"] == "waiting"
+        e = edits.new_edit()
+        e["genre"] = genre
+
+        def setg(d):
+            jj = d["jobs"][job_id]
+            edits.apply(jj, e)
+            jj["genre"] = genre
+            jj["status"] = "processing"
+        store.update(setg)
+        await cq.message.answer(f"Монтирую как {edits.GENRES[genre]['name']}.")
+        await _process(cq.message.chat.id, job_id, new_caption=True, hint=j.get("hint") if first else None)
+    elif action == "gq":
+        await cq.message.answer(GENRE_QUESTION, reply_markup=_genre_kb(job_id))
+        await cq.message.edit_reply_markup(reply_markup=_kb(job_id))
+    elif action == "ed":
         _awaiting_edit[cq.message.chat.id] = job_id
         await cq.message.answer(EDIT_PROMPT)
     elif action == "st":
@@ -470,7 +526,7 @@ def _target_job(chat_id: int) -> str | None:
     if job_id:
         return job_id
     jobs = [j for j in store.load()["jobs"].values()
-            if j.get("chat_id") == chat_id and j["status"] in ("review", "scheduled", "failed")
+            if j.get("chat_id") == chat_id and j["status"] in ("review", "scheduled", "failed", "waiting")
             and time.time() - j.get("created", 0) < 3 * 86400]
     return max(jobs, key=lambda j: j.get("created", 0))["id"] if jobs else None
 
@@ -565,6 +621,14 @@ async def on_text(m: Message):
     store.update(lambda d: flags.update(edits.apply(d["jobs"][job_id], e)))
 
     said = edits.summary(e)
+    if j["status"] == "waiting":
+        # жанр ещё не выбран: из этого сообщения берём жанр и пожелания, остальное — рассказ
+        store.update(lambda d: d["jobs"][job_id].update({"genre": d["jobs"][job_id].get("genre") or "talk",
+                                                         "status": "processing"}))
+        g = store.load()["jobs"][job_id]["genre"]
+        await m.answer(f"Монтирую как {edits.GENRES[g]['name']}" + (": " + html.escape("; ".join(said)) if said else "") + ".")
+        await _process(m.chat.id, job_id, new_caption=True, hint=" ".join(x for x in (j.get("hint"), request) if x))
+        return
     if said:
         await m.answer("Хорошо: " + html.escape("; ".join(said)) + ".")
     if e.get("unsupported"):
@@ -580,7 +644,8 @@ async def on_text(m: Message):
         await _process(m.chat.id, job_id, new_caption=flags["recaption"], hint=request if flags["recaption"] else None)
     elif flags["recaption"]:
         jj = store.load()["jobs"][job_id]
-        c = await asyncio.to_thread(captions.make_caption, words, jj.get("badge"), request)
+        c = await asyncio.to_thread(captions.make_caption, words, jj.get("badge"), request,
+                                    _job_flag(jj, "cta", True), jj.get("genre"))
         store.update(lambda d: d["jobs"][job_id].update({"caption": c["caption"], "hashtags": c["hashtags"],
                                                          "caption_source": c["source"]}))
         await _send_preview(m.chat.id, job_id)

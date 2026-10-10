@@ -13,15 +13,19 @@ from . import library
 MSK = ZoneInfo("Europe/Moscow")
 
 EMPTY = {
+    # жанр ролика: talk (рассказ), vlog (влог, путешествие, зарисовка), sketch (комедийный скетч)
+    "genre": None,
+    # «больше ничего не делай»: только субтитры и цвет, без нарезки, картинок, музыки, заголовка, заставки
+    "minimal": None,
     # нарезка
-    "cut": None, "keep_retakes": None, "trim_start": None, "trim_end": None,
+    "cut": None, "smooth": [], "keep_retakes": None, "trim_start": None, "trim_end": None,
     "remove_phrases": [], "restore_phrases": [],
     # темп и кадр
     "speed": None, "zoom": None, "zoom_words": [], "mirror": None,
     # цвет
     "color": None,
     # субтитры
-    "subs": None, "sub_size": None, "sub_pos": None, "sub_case": None, "sub_color": None, "sub_font": None,
+    "subs": None, "sub_size": None, "sub_pos": None, "sub_shift": None, "sub_case": None, "sub_color": None, "sub_font": None,
     "sub_words": None, "fixes": [], "accents": [], "auto_accents": None,
     # картинки
     "no_cards": None, "card_scale": None, "card_pos": None, "card_secs": None, "cards_off": [],
@@ -34,7 +38,7 @@ EMPTY = {
     # текст в кадре
     "style": None, "title": None, "title_on": None, "badge": None, "end_card": None,
     # подпись к посту
-    "caption": None, "recaption": None, "hashtags_add": [], "hashtags_remove": [],
+    "caption": None, "recaption": None, "cta": None, "hashtags_add": [], "hashtags_remove": [],
     # обложка
     "cover_text": None, "cover_at": None,
     # публикация: queue / now / archive / cancel; время «ГГГГ-ММ-ДД ЧЧ:ММ» по МСК
@@ -45,10 +49,35 @@ EMPTY = {
 }
 
 # какие поля хранятся в настройках монтажа ролика (job["opts"])
-OPT_KEYS = ["cut", "keep_retakes", "trim_start", "trim_end", "speed", "zoom", "mirror", "color", "subs", "sub_size",
+OPT_KEYS = ["sub_shift", "cut", "keep_retakes", "trim_start", "trim_end", "speed", "zoom", "mirror", "color", "subs", "sub_size",
             "sub_pos", "sub_case", "sub_color", "sub_font", "sub_words", "card_scale", "card_pos", "card_secs",
             "music_vol", "voice_vol", "denoise", "end_card", "title_on"]
-LIST_OPTS = ["zoom_words", "cards_off", "fixes", "sounds", "effects"]
+LIST_OPTS = ["zoom_words", "cards_off", "fixes", "sounds", "effects", "smooth"]
+
+# Жанры: с чего начинается монтаж. Правки поверх жанра сохраняются, смена жанра сбрасывает его настройки.
+GENRES = {
+    "talk": {"name": "рассказ", "desc": "нарезка, картинки, выделения, как ролики Полины", "opts": {}, "job": {"no_cards": None, "auto_accents": None, "cta": True}},
+    "vlog": {"name": "влог / зарисовка", "desc": "ролик целиком, без вырезаний, картинок и заголовка, только субтитры",
+             "opts": {"cut": "none", "zoom": "off", "title_on": False, "end_card": False},
+             "job": {"no_cards": True, "auto_accents": False, "cta": False}},
+    "sketch": {"name": "скетч / комедия", "desc": "плотная нарезка, без картинок и заголовка",
+               "opts": {"cut": "tight", "title_on": False, "end_card": False},
+               "job": {"no_cards": True, "auto_accents": False, "cta": False}},
+}
+GENRE_WORDS = [
+    ("sketch", r"комеди|скетч|юмор|смешн|прикол|сценк|пародия|шутк\w* ролик"),
+    ("vlog", r"путешеств|влог|блог|зарисовк|поездк|прогулк|отпуск|трип|из поезд|из отпуск|повседнев|лайфстайл"),
+    ("talk", r"рассказ|лекци|просвет|образоват|познават|религиовед|про истори|научн"),
+]
+FONT_WORDS = [  # как могут назвать шрифт → имя шрифта
+    (r"рукопис|от руки|почерк", "Caveat"), (r"каллиграф|пропис|витиеват", "Marck Script"),
+    (r"лобстер|ретро|винтаж", "Lobster"), (r"пасифик|летн|пляжн|курортн", "Pacifico"),
+    (r"амати|тонк\w* рукопис|узк", "Amatic SC"), (r"элегантн|журнальн|плейфер|playfair", "Playfair Display"),
+    (r"монтсерр|montserrat|современн|жирн", "Montserrat"), (r"рубик|округл", "Rubik"),
+    (r"комфорта|мягк|кругл|милый|мил", "Comfortaa"), (r"руссо|спортивн|квадратн|грубоват|брутальн", "Russo One"),
+    (r"анбаунд|unbounded|широк|модн", "Unbounded"), (r"засеч|красив|старинн|ораниенбаум|oranienbaum", "Oranienbaum"),
+    (r"прост|рублен|без засеч|jost|джост|как у полин|обычн", "Jost"),
+]
 
 COLOR_WORDS = {"красн": "red", "золот": "gold", "желт": "yellow", "бел": "white", "черн": "black", "розов": "pink",
                "коралл": "pink", "син": "indigo", "фиолет": "purple", "сирен": "purple", "зелен": "green",
@@ -101,17 +130,18 @@ def _target(clause: str, loose: bool = False) -> str | None:
             words = re.findall(r"[\wё-]+", tail)[:3]
             return " ".join(words) or None
     m = re.search(r"(?:на слов\w*|на фраз\w*|\bслов[оа]\b|\bфразу\b|где (?:я |она )?(?:говор\w*|произнош\w*)|когда (?:я |она )?говор\w*|"
-                  r"после слов\w*|на моменте|в момент\w*,? где|про)\s+(.+)$", clause)
+                  r"после слов\w*|после фраз\w*|после того,? как (?:я |она )?(?:говор\w*|сказа\w*)|на моменте|в момент\w*,? где|про)\s+(.+)$", clause)
     if not m:
         return None
-    tail = re.split(r"\b(?:и|а|потом|ещё|еще|тоже|пожалуйста)\b", m.group(1))[0]
+    tail = re.split(r"\b(?:и|а|потом|ещё|еще|тоже|пожалуйста|резк\w*|склейк\w*|сделай|перемонтир\w*|"
+                    r"получ\w*|плавн\w*|поставь|добавь|убери)\b", m.group(1), flags=re.I)[0]
     words = [w for w in re.findall(r"[\wё-]+", tail)]
-    while words and _n(words[0]) in ("про", "о", "об", "где", "что", "как", "я", "она", "говорю", "говорит"):
+    while words and _n(words[0]) in ("про", "о", "об", "где", "я", "она", "говорю", "говорит"):
         words = words[1:]
     return " ".join(words[:3]) or None
 
 
-NEG = ("убер", "без ", "не надо", "не нуж", "выключ", "отключ", "удали", "не став", "не добавл", "уйди", "сним", "долой")
+NEG = ("убер", "убр", "без ", "не надо", "не нуж", "выключ", "отключ", "удали", "не став", "не добавл", "уйди", "сним", "долой")
 
 
 def _neg(c: str) -> bool:
@@ -127,8 +157,9 @@ def _clauses(text: str) -> list[str]:
     out = []
     for p in parts:
         # «… и …» делим, только если обе части похожи на просьбы (а не «руны и луна»)
-        bits = re.split(r"\s+и\s+(?=(?:сделай|добавь|убери|поставь|вырежи|верни|выдели|смени|поменяй|перепиши|"
-                        r"выложи|увеличь|уменьши|подними|опусти|ускорь|замедли|обрежь|наложи|включи|выключи)\w*)", p)
+        bits = re.split(r"\s+и\s+(?=(?:сделай|сделал|добавь|добавил|убери|убрал|поставь|вырежи|верни|выдели|смени|"
+                        r"поменяй|перепиши|выложи|увеличь|уменьши|подними|опусти|ускорь|замедли|обрежь|наложи|"
+                        r"включи|выключи|перемонтир|подкрас|измени|отрази)\w*)", p, flags=re.I)
         out += [b.strip() for b in bits if b.strip()]
     return out
 
@@ -137,6 +168,25 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
     """Разбор правки без Claude: понимает самые частые просьбы во всех разделах, по нескольку за раз."""
     e = new_edit()
     o = job.get("opts") or {}
+    whole = _n(request)
+    # жанр, «больше ничего не делай», «от начала до конца», ссылка на Telegram — смотрим на всю просьбу целиком
+    for raw in _clauses(request):
+        c = _n(raw)
+        if re.search(r"\bне (?:про|из|в) |\bне (?:влог|скетч|рассказ)", c):
+            continue
+        for g, pat in GENRE_WORDS:
+            if re.search(pat, c) and not re.search(r"подпис|хе?ш-?тег|хэш", c):
+                e["genre"] = e["genre"] or g
+    if re.search(r"больше ничего не делай|ничего больше не делай|только субтитр|ничего лишнего|ничего не добавляй|"
+                 r"ничего не меняй кроме|ничего другого не", whole):
+        e["minimal"] = True
+    if re.search(r"от начала (?:и )?до конца|целиком|не обрезай|ничего не вырезай|без нарезк|не режь|как есть|"
+                 r"полностью весь|весь ролик целиком", whole):
+        e["cut"] = "none"
+    if re.search(r"(?:не надо|без|убери|убрал|не нужн\w*|не став\w*)\s(?:\w+\s){0,3}(?:ссылк|телеграм|призыв)", whole):
+        e["cta"] = False
+    elif re.search(r"(?:добавь|верни|постав\w*)\s(?:\w+\s){0,3}(?:ссылк|телеграм|призыв)", whole):
+        e["cta"] = True
     for raw in _clauses(request):
         c = _n(raw)
         q = _quoted(raw)
@@ -144,6 +194,10 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
         neg = _neg(c)
         add = any(k in c for k in ("добав", "верни", "включ", "постав", "наложи", "вставь", "сделай", "нужн", "хочу"))
         handled = False
+        if re.search(r"ссылк|телеграм|призыв", c) and e["cta"] is not None and not re.search(r"подпис\w*\s*[:—-]?\s*[«\"]", raw):
+            continue
+        if re.search(r"больше ничего не делай|ничего больше не делай|ничего лишнего|от начала (?:и )?до конца", c):
+            continue
 
         # ── публикация
         if re.search(r"выклад|выложи|опублику|публику|в очередь|в архив|отмени публик|сними с публ|запланир", c):
@@ -223,11 +277,19 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
                 else:
                     e["unsupported"].append("исправить слово: напишите «исправь „как сейчас“ на „как надо“»")
                 continue
-            if neg and not re.search(r"больш|мельч|меньш|крупн", c):
+            if re.search(r"были одни|одни субтитр|только одни|двойн|дублир|два раза|дважды|две строк", c):
+                e["title_on"] = False  # второй строкой шёл заголовок: убираем его, субтитры остаются одни
+                continue
+            if neg and not re.search(r"больш|мельч|меньш|крупн|выше|ниже", c):
                 e["subs"] = False
                 continue
-            if add and ("верни" in c or "включ" in c):
+            if add or re.search(r"наложи|нужны|включи", c):
                 e["subs"] = True
+            step = 70 if re.search(r"чуть|немн|слегка|капельк", c) else 150
+            if re.search(r"выше|подними|повыше|поднять", c):
+                e["sub_shift"] = int(o.get("sub_shift") or 0) + step
+            elif re.search(r"ниже|опусти|пониже|опустить", c):
+                e["sub_shift"] = int(o.get("sub_shift") or 0) - step
             if re.search(r"заглавн|капс|больш\w* букв|прописн", c):
                 e["sub_case"] = "upper"
             elif re.search(r"строчн|маленьк\w* букв", c):
@@ -244,10 +306,18 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
             col = _color(c)
             if col:
                 e["sub_color"] = col
-            if re.search(r"засеч|красив|оранienbaum|ораниенбаум|старинн", c):
-                e["sub_font"] = "Oranienbaum"
-            elif re.search(r"прост|рублен|без засеч|jost|джост", c):
-                e["sub_font"] = "Jost"
+            elif re.search(r"цвет", c) and re.search(r"друг|смени|поменя|измени", c):
+                cycle = ["white", "yellow", "pink", "gold", "red"]
+                cur = o.get("sub_color")
+                e["sub_color"] = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else "white"
+            if "шрифт" in c or re.search(r"рукопис|каллиграф|засеч", c):
+                font = next((f for pat, f in FONT_WORDS if re.search(pat, c)), None)
+                if not font and re.search(r"друг|смени|поменя|измени|ин[оа]", c):
+                    from .edit import SUB_FONTS
+                    cur = o.get("sub_font") or "Jost"
+                    font = SUB_FONTS[(SUB_FONTS.index(cur) + 1) % len(SUB_FONTS)] if cur in SUB_FONTS else "Montserrat"
+                if font:
+                    e["sub_font"] = font
             m = re.search(r"по (\d|одн|дв|тр|четыр)\w*\s*слов", c)
             if m:
                 e["sub_words"] = {"одн": 1, "дв": 2, "тр": 3, "четыр": 4}.get(m.group(1), None) or int(m.group(1))
@@ -383,6 +453,13 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
             sec = _num(c)
             e["trim_end"] = sec if sec is not None and sec < 60 else 2.0
             continue
+        if re.search(r"склейк|перемонтир|плавн|резк\w* (?:переход|обрыв)|дерга|обрыв|обрезан\w* слов|оборва", c):
+            st = _target(raw)
+            if st:
+                e["smooth"].append(st)
+            elif not e["smooth"] and not re.search(r"после слов", whole):
+                e["cut"] = e["cut"] or "gentle"
+            continue
         if re.search(r"верни\w*", c) and (q or re.search(r"фраз|кусок|слов|момент", c)):
             if q or tgt:
                 e["restore_phrases"].append(q[0] if q else tgt)
@@ -457,10 +534,15 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
                 sp = sp * 1.1
             e["speed"] = round(max(0.7, min(1.6, sp)), 2)
 
-        if re.search(r"подлинн|длиннее|меньше режь|меньше вырез|не режь|оставь пауз|помягче|воздух|не так рез", c):
-            e["cut"], hit = "gentle", True
+        if re.search(r"длинн|длиньше|подольше|меньше режь|меньше вырез|оставь пауз|помягче|воздух|не так рез|"
+                     r"увелич\w* (?:длин|ролик|видео|хрономет)", c):
+            if e["cut"] != "none":
+                e["cut"] = "gentle"
+            hit = True
         elif re.search(r"короче|покороче|плотнее|динамичн|бодрее|живее|убери (?:все )?пауз|режь сильнее|больше режь|туже", c):
-            e["cut"], hit = "tight", True
+            if e["cut"] != "none":
+                e["cut"] = "tight"
+            hit = True
         elif re.search(r"нарезк|паузы", c) and re.search(r"как было|обычн|верни", c):
             e["cut"], hit = "normal", True
         if hit:
@@ -479,7 +561,14 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
         if not handled and re.search(r"переделай|не нравит|плохо|ужасн|по-другому", c):
             e["unsupported"].append("общая переделка: скажите, что именно поменять (цвет, темп, субтитры, картинки…)")
 
+    # ролик и так целиком (влог) — «подлиннее» не должно включать нарезку
+    g = e["genre"] or job.get("genre") or "talk"
+    cur_cut = o.get("cut") if (o.get("cut") and not e["genre"]) else GENRES[g]["opts"].get("cut")
+    if e["cut"] == "gentle" and cur_cut == "none":
+        e["cut"] = None
     _dedup(e)
+    if summary(e):  # «плохо, переделай» рядом с понятными правками — не повод говорить «не умею»
+        e["unsupported"] = [u for u in e["unsupported"] if not u.startswith("общая переделка")]
     return e
 
 
@@ -558,6 +647,23 @@ def apply(job: dict, e: dict) -> dict:
     """Переносит правку в ролик. Возвращает, что делать дальше: render / recaption / cover / publish."""
     o = job.setdefault("opts", {})
     render = False
+    recaption = False
+    if e.get("genre") in GENRES and e["genre"] != job.get("genre"):
+        g = GENRES[e["genre"]]
+        job["genre"] = e["genre"]
+        for k in g["opts"]:
+            o.pop(k, None)  # настройки жанра заменяют прежние
+        for k in ("no_cards", "auto_accents", "cta"):
+            job.pop(k, None)
+        render = recaption = True
+    if e.get("minimal"):
+        o.update({"cut": "none", "zoom": "off", "title_on": False, "end_card": False, "sounds": [], "effects": [],
+                  "zoom_words": []})
+        job.update({"no_cards": True, "music": False, "auto_accents": False, "cta": False, "badge": None})
+        render = recaption = True
+    if e.get("cta") is not None:
+        job["cta"] = e["cta"]
+        recaption = True
     for k in e.get("clear") or []:
         if k == "removed":
             job["removed"] = []
@@ -580,7 +686,7 @@ def apply(job: dict, e: dict) -> dict:
         job.pop("bright", None)
     if e.get("cut") is not None:
         job.pop("gentle", None)
-    for k in ("zoom_words", "cards_off"):
+    for k in ("zoom_words", "cards_off", "smooth"):
         if e.get(k):
             o[k] = list(dict.fromkeys((o.get(k) or []) + e[k]))
             render = True
@@ -635,17 +741,23 @@ def apply(job: dict, e: dict) -> dict:
     if e.get("cover_at") is not None:
         job["cover_at"] = max(0.0, float(e["cover_at"]))
         cover = True
-    return {"render": render, "recaption": bool(e.get("recaption")) and not e.get("caption"),
+    return {"render": render, "recaption": (recaption or bool(e.get("recaption"))) and not e.get("caption"),
             "cover": cover or render, "publish": e.get("publish"), "when": e.get("publish_when")}
 
 
 def summary(e: dict) -> list[str]:
     """Что поняли, по-человечески: для ответа «Хорошо: …»."""
     s = []
+    if e.get("genre") in GENRES:
+        s.append(f"жанр: {GENRES[e['genre']]['name']} ({GENRES[e['genre']]['desc']})")
+    if e.get("minimal"):
+        s.append("только субтитры и цвет, больше ничего не добавляю")
     cut = {"tight": "режу плотнее, ролик станет короче", "gentle": "режу мягче, оставлю паузы, ролик станет длиннее",
-           "normal": "нарезка как обычно"}
+           "normal": "нарезка как обычно", "none": "ничего не вырезаю, ролик целиком от начала до конца"}
     if e.get("cut"):
         s.append(cut[e["cut"]])
+    for p in e.get("smooth") or []:
+        s.append(f"после «{p}» склейка плавнее, паузу оставлю")
     if e.get("keep_retakes") is True:
         s.append("оставлю повторные дубли")
     if e.get("trim_start"):
@@ -670,17 +782,19 @@ def summary(e: dict) -> list[str]:
     if e.get("subs") is False:
         s.append("без субтитров")
     elif e.get("subs") is True:
-        s.append("верну субтитры")
+        s.append("с субтитрами")
     if e.get("sub_size"):
         s.append(f"субтитры {'крупнее' if e['sub_size'] > 1 else 'мельче'}")
     if e.get("sub_pos"):
         s.append(f"субтитры {POS_NAMES[e['sub_pos']]}")
+    if e.get("sub_shift") is not None:
+        s.append("субтитры выше" if e["sub_shift"] > 0 else "субтитры ниже" if e["sub_shift"] < 0 else "субтитры на место")
     if e.get("sub_case"):
         s.append({"upper": "субтитры заглавными", "lower": "субтитры строчными", "normal": "субтитры обычным регистром"}[e["sub_case"]])
     if e.get("sub_color"):
         s.append(f"субтитры {COLOR_NAMES.get(e['sub_color'], e['sub_color'])}")
     if e.get("sub_font"):
-        s.append("шрифт с засечками" if e["sub_font"] == "Oranienbaum" else "простой шрифт")
+        s.append(f"шрифт {e['sub_font']}")
     if e.get("sub_words"):
         s.append(f"по {int(e['sub_words'])} сл. на экране")
     for f in e.get("fixes") or []:
@@ -728,8 +842,8 @@ def summary(e: dict) -> list[str]:
         s.append(f"стиль {STYLE_NAMES.get(e['style'], e['style'])}")
     if e.get("title"):
         s.append(f"заголовок «{e['title']}»")
-    elif e.get("title_on") is False:
-        s.append("без заголовка в кадре")
+    elif e.get("title_on") is False and not e.get("minimal"):
+        s.append("без заголовка в кадре, субтитры будут одни")
     elif e.get("title_on") is True:
         s.append("с заголовком в кадре")
     if e.get("badge") == "":
@@ -738,6 +852,10 @@ def summary(e: dict) -> list[str]:
         s.append(f"плашка «{e['badge']}»")
     if e.get("end_card") is not None:
         s.append("с финальной заставкой" if e["end_card"] else "без финальной заставки")
+    if e.get("cta") is False:
+        s.append("подпись без ссылки на Telegram")
+    elif e.get("cta") is True:
+        s.append("в подписи будет ссылка на Telegram")
     if e.get("caption"):
         s.append("новая подпись")
     elif e.get("recaption"):
@@ -759,16 +877,18 @@ def summary(e: dict) -> list[str]:
 
 CATALOG = """Что можно попросить (текстом или голосом, можно несколько правок сразу):
 
-✂️ Нарезка: «сделай короче / динамичнее», «подлиннее, оставь паузы», «вырежи „ну короче“», «верни фразу „про луну“», «оставь дубли», «обрежь 3 секунды в начале», «убери последние 2 секунды»
+🎭 Жанр: «это рассказ» (как ролики Полины про религии и историю: нарезка, картинки, выделения), «это влог из путешествия» / «зарисовка» (ролик целиком, без вырезаний и картинок, только субтитры), «это скетч» / «комедия» (плотная нарезка, без картинок). «Больше ничего не делай, только субтитры» — ролик целиком, только субтитры и цвет.
+
+✂️ Нарезка: «сделай короче / динамичнее», «подлиннее, оставь паузы», «от начала до конца, ничего не вырезай», «после слов „смотрите какой вид“ резкая склейка, сделай плавнее», «вырежи „ну короче“», «верни фразу „про луну“», «оставь дубли», «обрежь 3 секунды в начале», «убери последние 2 секунды»
 ⏩ Темп: «быстрее», «медленнее», «ускорь в 1.2 раза», «темп как было»
 🔍 Кадр: «без зумов», «больше зумов», «наезд на слове „мошенница“», «отрази кадр»
 🎨 Цвет: «ярче», «темнее», «светлее», «теплее», «холоднее», «приглуши», «контрастнее», «чёрно-белое», «без цветокоррекции», «цвет как было»
-💬 Субтитры: «убери субтитры», «субтитры крупнее / мельче», «субтитры снизу / сверху / по центру», «заглавными / строчными», «субтитры белым», «шрифт с засечками», «по одному слову», «исправь „блаватская“ на „Блаватская“», «выдели „новолуние“ красным», «не выделяй слова»
+💬 Субтитры: «убери субтитры», «субтитры крупнее / мельче», «субтитры снизу / сверху / по центру», «субтитры выше / чуть ниже», «чтобы субтитры были одни», «заглавными / строчными», «субтитры белым», «шрифт рукописный / с засечками / современный / мягкий / спортивный / элегантный / ретро», «поменяй шрифт», «поменяй цвет субтитров», «по одному слову», «исправь „блаватская“ на „Блаватская“», «выдели „новолуние“ красным», «не выделяй слова»
 🖼 Картинки: «без картинок», «убери картинку на слове „луна“», «картинки крупнее / мельче», «картинки снизу / сверху», «показывай картинки дольше»; новую картинку пришлите фото с подписью «на слово …»
 🔊 Звук: «без музыки», «музыка тише / громче», «голос громче», «убери шум», «звук бум на слове „казнили“», «ба-дум-тсс на „шутка“», «убери звуки»; свою музыку пришлите mp3-файлом
 ✨ Эффекты: «молния на „мошенница“», «искры на слове „огонь“», «дым», «засвет», «глитч», «звёздочки», «свечение», «чёрно-белая вставка на „скучно“», «убери эффекты»
 🏷 Текст в кадре: «заголовок: „Руны на неделю“», «без заголовка», «плашка: „14-е лунные сутки“», «убери плашку», «добавь финальную заставку», «стиль как у Полины / светлый / ночной»
-📝 Подпись: «перепиши подпись короче / веселее / про путешествия», «подпись: „свой текст“», «добавь хештег #таро», «убери хештег #луна»
+📝 Подпись: «перепиши подпись короче / веселее / про путешествия», «подпись: „свой текст“», «без ссылки на Телеграм», «добавь хештег #таро», «убери хештег #луна»
 🖼 Обложка: «обложка с 5 секунды», «другой кадр на обложку», «текст на обложке „Кто такая Блаватская“»
 📅 Публикация: «в очередь», «выложи сейчас», «выложи завтра в 12», «в пятницу в 19:00», «в архив», «отмени публикацию»
 
