@@ -25,6 +25,7 @@ PAD_AFTER = 0.16
 RETAKE_GAP = 0.9     # пауза, после которой ищем повторный дубль
 CARD_SECONDS = 2.2
 END_SECONDS = 2.4
+BRIGHT = ",eq=saturation=1.3:brightness=0.03:contrast=1.04"  # просьба «ярче», «подкрась»
 FILLERS = {"э", "ээ", "эээ", "эм", "эмм", "мм", "ммм", "хм", "а-а", "э-э"}
 
 
@@ -68,8 +69,11 @@ def _drop_retakes(phrases):
     return kept
 
 
-def plan_cuts(words, duration):
-    """Возвращает (отрезки исходника [(start, end)], слова в новом времени)."""
+def plan_cuts(words, duration, gentle=False):
+    """Возвращает (отрезки исходника [(start, end)], слова в новом времени).
+
+    gentle: режем мягче (просьба «сделай подлиннее»): оставляем паузы до 1.5 с и больше воздуха вокруг фраз."""
+    max_gap, pad_before, pad_after = (1.5, 0.3, 0.5) if gentle else (MAX_GAP, PAD_BEFORE, PAD_AFTER)
     words = [w for w in words if _norm(w["word"]) not in FILLERS]
     words = [w for ph in _drop_retakes(_phrases(words)) for w in ph]
     if not words:
@@ -77,7 +81,7 @@ def plan_cuts(words, duration):
 
     groups, cur = [], [words[0]]
     for w in words[1:]:
-        if w["start"] - cur[-1]["end"] > MAX_GAP:
+        if w["start"] - cur[-1]["end"] > max_gap:
             groups.append(cur)
             cur = []
         cur.append(w)
@@ -85,8 +89,8 @@ def plan_cuts(words, duration):
 
     segments, new_words, t_out, prev_end = [], [], 0.0, 0.0
     for gi, g in enumerate(groups):
-        s = max(prev_end, g[0]["start"] - PAD_BEFORE, 0.0)
-        e = min(duration, g[-1]["end"] + PAD_AFTER)
+        s = max(prev_end, g[0]["start"] - pad_before, 0.0)
+        e = min(duration, g[-1]["end"] + pad_after)
         if gi + 1 < len(groups):
             e = min(e, groups[gi + 1][0]["start"] - 0.02)
         if e - s < 0.15:
@@ -325,8 +329,10 @@ def _zoom_expr(segments, zoom):
 
 
 def render(src, words, out_path, style="night", music=None, badge=None, title=None, workdir=None, cards=True,
-           accents=None, auto_accents=True, extra_cards=None, auto_cards=True, end_card=True, preset="medium", seek=0.0):
-    """extra_cards: [{"word": номер слова в исходной расшифровке, "image": путь}] — картинки в заданные места."""
+           accents=None, auto_accents=True, extra_cards=None, auto_cards=True, end_card=True, preset="medium", seek=0.0,
+           bright=False, gentle=False):
+    """bright: ярче и сочнее цвет. gentle: режем паузы мягче, ролик длиннее.
+    extra_cards: [{"word": номер слова в исходной расшифровке, "image": путь}] — картинки в заданные места."""
     st = STYLES[style]
     words = [dict(w, i=w.get("i", k)) for k, w in enumerate(words)]
     words = mark_accents(words, accents, auto_accents)
@@ -337,7 +343,7 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
         # монтируем кусок длинного ролика: читаем исходник с отметки seek
         words = [dict(w, start=round(w["start"] - seek, 3), end=round(w["end"] - seek, 3))
                  for w in words if w["start"] >= seek]
-    segments, new_words = plan_cuts(words, duration)
+    segments, new_words = plan_cuts(words, duration, gentle)
     total = sum(e - s for s, e in segments)
     end_sec = END_SECONDS if end_card and st.get("end_card", True) else 0.0
 
@@ -382,7 +388,7 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
     fc.append(
         f"[vc]fps={FPS},scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,"
         f"zoompan=z='{_zoom_expr(segments, st['zoom'])}':x='iw/2-(iw/zoom/2)':y='ih*0.4-(ih/zoom*0.4)':d=1:s={W}x{H}:fps={FPS},"
-        f"{st['grade']}[v_base]"
+        f"{st['grade']}{BRIGHT if bright else ''}[v_base]"
     )
     last = "v_base"
     for i, c in enumerate(cards):

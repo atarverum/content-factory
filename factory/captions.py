@@ -56,10 +56,13 @@ _EDIT_SCHEMA = {
             "additionalProperties": False,
         }},
         "auto_accents": {"type": ["boolean", "null"]},
+        "bright": {"type": ["boolean", "null"]},
+        "longer": {"type": ["boolean", "null"]},
+        "recaption": {"type": ["boolean", "null"]},
         "note": {"type": "string"},
     },
     "required": ["title", "caption", "style", "badge", "music", "remove_phrases", "no_cards",
-                 "accents", "auto_accents", "note"],
+                 "accents", "auto_accents", "bright", "longer", "recaption", "note"],
     "additionalProperties": False,
 }
 
@@ -107,6 +110,7 @@ def transcript_text(words: list[dict]) -> str:
 
 # Хештеги для подписи без Claude: тема ролика по словам из расшифровки (порядок = приоритет).
 _TOPIC_TAGS = [
+    (("путешеств", "поездк", "дорог", "зарисовк"), ["#путешествия", "#зарисовка", "#ведьмавпути"]),
     (("лунн", "луна", "луны", "новолун", "полнолун"), ["#лунныесутки", "#луна", "#лунныйкалендарь"]),
     (("рун",), ["#руны", "#рунология", "#расклад"]),
     (("таро", "аркан"), ["#таро", "#картытаро", "#расклад"]),
@@ -116,8 +120,12 @@ _TOPIC_TAGS = [
 ]
 
 
-def _topic_tags(text: str) -> list[str]:
-    t = text.lower().replace("ё", "е")
+def _topic_tags(text: str, hint: str = "") -> list[str]:
+    """Хештеги по словам ролика и пожеланию Полины. Части пожелания с «убери», «не про» и т. п. пропускаем."""
+    norm = lambda x: x.lower().replace("ё", "е")
+    clauses = [c for c in re.split(r"[.,;!?]|\bно\b|\bа\b", norm(hint))
+               if not any(x in c for x in ("убер", "не из", "не про", "без ", "не надо", "не ну"))]
+    t = norm(text) + " " + " ".join(clauses)
     tags = []
     for keys, add in _TOPIC_TAGS:
         if any(k in t for k in keys):
@@ -126,7 +134,7 @@ def _topic_tags(text: str) -> list[str]:
     return tags[:8]
 
 
-def _template(text: str, badge: str | None) -> dict:
+def _template(text: str, badge: str | None, hint: str | None = None) -> dict:
     first = re.split(r"(?<=[.!?])\s+", text.strip())[0] if text.strip() else "Новое видео"
     title_words = re.sub(r"[^\w\s-]", "", first).split()[:5]
     title = " ".join(title_words).capitalize() or "Новое видео"
@@ -139,7 +147,7 @@ def _template(text: str, badge: str | None) -> dict:
     return {
         "title": title,
         "caption": caption,
-        "hashtags": _topic_tags(text + " " + (badge or "")),
+        "hashtags": _topic_tags(text + " " + (badge or ""), hint or ""),
         "rubric": "",
         "source": "template",
     }
@@ -156,7 +164,7 @@ def make_caption(words: list[dict], badge: str | None = None, hint: str | None =
     user += "\nПридумай заголовок на обложку, подпись, хештеги и рубрику (одним-двумя словами)."
     res = _ask(STYLE_GUIDE, user, _CAPTION_SCHEMA)
     if not res:
-        return _template(text, badge)
+        return _template(text, badge, hint)
     res["hashtags"] = [h if h.startswith("#") else "#" + h for h in res["hashtags"]]
     res["source"] = "claude"
     return res
@@ -174,7 +182,10 @@ accents: слова или фразы из расшифровки, которы�
 gold (золотой), indigo (синий/фиолетовый), green (зелёный), orange (оранжевый), paper (светлый), night (тёмный).
 Шрифты: Oranienbaum (красивый, с засечками, как в заголовках), Jost (простой, рубленый). Не указано → null.
 auto_accents: false, если просит не выделять слова автоматически; true, если вернуть; иначе null.
-Если просит изменить подпись или заголовок, сразу напиши новый текст в её стиле.
+bright: true, если просит ярче, сочнее, подкрасить цвет; false, если вернуть как было; иначе null.
+longer: true, если просит ролик подлиннее, резать меньше, оставить паузы; false, если снова резать плотно; иначе null.
+recaption: true, если просит переделать подпись, но сам текст ты не пишешь (обычно ставь caption и null).
+Если просит изменить подпись или заголовок, сразу напиши новый текст в её стиле, по теме ролика и её пожеланию.
 note: одна короткая фраза, что будет сделано."""
 
 
@@ -193,7 +204,8 @@ def _parse_edit_simple(request: str) -> dict:
     """Запасной разбор без Claude: понимает самые частые просьбы."""
     r = request.lower()
     res = {"title": None, "caption": None, "style": None, "badge": None, "music": None,
-           "remove_phrases": [], "no_cards": None, "accents": [], "auto_accents": None, "note": ""}
+           "remove_phrases": [], "no_cards": None, "accents": [], "auto_accents": None,
+           "bright": None, "longer": None, "recaption": None, "note": ""}
     m = re.search(r"заголов\w*\s*[:—-]?\s*[«\"](.+?)[»\"]", request, re.I)
     if m:
         res["title"] = m.group(1)
@@ -223,6 +235,22 @@ def _parse_edit_simple(request: str) -> dict:
         res["accents"].append({"phrase": m.group(1), "color": color, "font": font})
     if "не выделяй" in r or "без выделен" in r:
         res["auto_accents"] = False
+    if any(k in r for k in ("ярч", "ярк", "подкрас", "сочн", "насыщ")):
+        res["bright"] = True
+    if any(k in r for k in ("подлинн", "длиннее", "меньше режь", "меньше вырез", "не режь", "оставь пауз")):
+        res["longer"] = True
+    if "подпис" in r and not res["caption"]:
+        res["recaption"] = True
+    done = []
+    if res["bright"]:
+        done.append("сделаю цвет ярче")
+    if res["longer"]:
+        done.append("оставлю больше пауз, ролик станет длиннее")
+    if res["recaption"]:
+        done.append("перепишу подпись")
+    if done:
+        res["note"] = "Хорошо: " + ", ".join(done) + "."
+        return res
     res["note"] = "Применяю правку" if any(v for k, v in res.items() if k != "note") else ""
     return res
 

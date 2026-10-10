@@ -261,7 +261,8 @@ def _build(job_id: str, new_caption: bool, hint: str | None = None):
     tmp_out = f["out"] + ".tmp.mp4"
     info = render(f["src"], words, tmp_out, style=j["style"], music=_music_file(j.get("music")),
                   badge=j.get("badge"), title=title, workdir=f["dir"], cards=not j.get("no_cards"),
-                  accents=j.get("accents"), auto_accents=j.get("auto_accents", True))
+                  accents=j.get("accents"), auto_accents=j.get("auto_accents", True),
+                  bright=bool(j.get("bright")), gentle=bool(j.get("gentle")))
     os.replace(tmp_out, f["out"])
     make_cover(f["out"], title, f["cover"])
 
@@ -430,6 +431,12 @@ async def on_text(m: Message):
             jj["no_cards"] = e["no_cards"]
         if e.get("auto_accents") is not None:
             jj["auto_accents"] = e["auto_accents"]
+        if e.get("bright") is not None:
+            jj["bright"] = e["bright"]
+        if e.get("longer") is not None:
+            jj["gentle"] = e["longer"]
+        if e.get("recaption"):
+            jj["caption"] = None
         jj["accents"] = jj.get("accents", []) + e.get("accents", [])
         jj["removed"] = jj.get("removed", []) + e.get("remove_phrases", [])
         jj["status"] = "processing"
@@ -437,8 +444,16 @@ async def on_text(m: Message):
     if e.get("note"):
         await m.answer(html.escape(e["note"]))
     only_text = not any(e.get(k) is not None and e.get(k) != [] for k in
-                        ("title", "style", "badge", "music", "no_cards", "remove_phrases", "accents", "auto_accents"))
-    if only_text and e.get("caption"):
+                        ("title", "style", "badge", "music", "no_cards", "remove_phrases", "accents", "auto_accents",
+                         "bright", "longer"))
+    if only_text and e.get("recaption") and not e.get("caption"):
+        # подпись переписываем по пожеланию, видео не трогаем
+        c = await asyncio.to_thread(captions.make_caption, captions.remove_phrases(words, j.get("removed", [])),
+                                    j.get("badge"), request)
+        store.update(lambda d: d["jobs"][job_id].update({"caption": c["caption"], "hashtags": c["hashtags"],
+                                                         "caption_source": c["source"], "status": "review"}))
+        await _send_preview(m.chat.id, job_id)
+    elif only_text and e.get("caption"):
         store.update(lambda d: d["jobs"][job_id].__setitem__("status", "review"))
         await _send_preview(m.chat.id, job_id)
     elif only_text:
@@ -446,7 +461,8 @@ async def on_text(m: Message):
         _awaiting_edit[m.chat.id] = job_id
         await m.answer("Не поняла, что поменять. Попробуйте сказать иначе.")
     else:
-        await _process(m.chat.id, job_id, new_caption=False)
+        await _process(m.chat.id, job_id, new_caption=bool(e.get("recaption") and not e.get("caption")),
+                       hint=request if e.get("recaption") else None)
 
 
 # ───────────────────────── публикация по расписанию ─────────────────────────
