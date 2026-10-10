@@ -3,6 +3,7 @@
 Работает через Claude API (ключ ANTHROPIC_API_KEY). Если ключа нет или API недоступен,
 используется простой шаблон, чтобы фабрика не останавливалась.
 """
+import datetime as dt
 import json
 import os
 import re
@@ -34,37 +35,55 @@ _CAPTION_SCHEMA = {
     "additionalProperties": False,
 }
 
-_EDIT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "title": {"type": ["string", "null"]},
-        "caption": {"type": ["string", "null"]},
-        "style": {"type": ["string", "null"], "enum": ["polina", "night", "paper", None]},
-        "badge": {"type": ["string", "null"]},
-        "music": {"type": ["boolean", "null"]},
-        "remove_phrases": {"type": "array", "items": {"type": "string"}},
-        "no_cards": {"type": ["boolean", "null"]},
-        "accents": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "phrase": {"type": "string"},
-                "color": {"type": ["string", "null"],
-                          "enum": ["red", "gold", "indigo", "green", "orange", "paper", "night", None]},
-                "font": {"type": ["string", "null"], "enum": ["Oranienbaum", "Jost", None]},
-            },
-            "required": ["phrase", "color", "font"],
-            "additionalProperties": False,
-        }},
-        "auto_accents": {"type": ["boolean", "null"]},
-        "bright": {"type": ["boolean", "null"]},
-        "longer": {"type": ["boolean", "null"]},
-        "recaption": {"type": ["boolean", "null"]},
-        "note": {"type": "string"},
-    },
-    "required": ["title", "caption", "style", "badge", "music", "remove_phrases", "no_cards",
-                 "accents", "auto_accents", "bright", "longer", "recaption", "note"],
-    "additionalProperties": False,
-}
+def _edit_schema() -> dict:
+    """Схема правки для Claude: те же поля, что в edits.EMPTY."""
+    from . import edits, library
+
+    def nul(t, enum=None):
+        x = {"type": [t, "null"]}
+        if enum:
+            x["enum"] = enum + [None]
+        return x
+
+    def arr(items):
+        return {"type": "array", "items": items}
+
+    def obj(props):
+        return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
+
+    pos = ["top", "middle", "bottom"]
+    props = {
+        "cut": nul("string", ["tight", "normal", "gentle"]), "keep_retakes": nul("boolean"),
+        "trim_start": nul("number"), "trim_end": nul("number"),
+        "remove_phrases": arr({"type": "string"}), "restore_phrases": arr({"type": "string"}),
+        "speed": nul("number"), "zoom": nul("string", ["off", "normal", "strong"]),
+        "zoom_words": arr({"type": "string"}), "mirror": nul("boolean"),
+        "color": {"type": ["array", "null"], "items": {"type": "string", "enum": list(edits.LOOK_NAMES)}},
+        "subs": nul("boolean"), "sub_size": nul("number"), "sub_pos": nul("string", pos),
+        "sub_case": nul("string", ["upper", "lower", "normal"]), "sub_color": nul("string", list(edits.COLOR_NAMES)),
+        "sub_font": nul("string", ["Jost", "Oranienbaum"]), "sub_words": nul("integer"),
+        "fixes": arr(obj({"from": {"type": "string"}, "to": {"type": "string"}})),
+        "accents": arr(obj({"phrase": {"type": "string"},
+                            "color": nul("string", ["red", "gold", "indigo", "green", "orange", "paper", "night"]),
+                            "font": nul("string", ["Oranienbaum", "Jost"])})),
+        "auto_accents": nul("boolean"),
+        "no_cards": nul("boolean"), "card_scale": nul("number"), "card_pos": nul("string", pos),
+        "card_secs": nul("number"), "cards_off": arr({"type": "string"}),
+        "music": nul("boolean"), "music_vol": nul("number"), "voice_vol": nul("number"), "denoise": nul("boolean"),
+        "sounds": arr(obj({"phrase": {"type": "string"}, "sound": {"type": "string", "enum": list(library.SOUNDS)}})),
+        "effects": arr(obj({"phrase": {"type": "string"}, "effect": {"type": "string", "enum": list(library.EFFECTS)}})),
+        "clear": arr({"type": "string", "enum": ["sounds", "effects", "zoom_words", "accents", "cards_off", "fixes",
+                                                 "removed", "color"]}),
+        "style": nul("string", ["polina", "night", "paper"]), "title": nul("string"), "title_on": nul("boolean"),
+        "badge": nul("string"), "end_card": nul("boolean"),
+        "caption": nul("string"), "recaption": nul("boolean"),
+        "hashtags_add": arr({"type": "string"}), "hashtags_remove": arr({"type": "string"}),
+        "cover_text": nul("string"), "cover_at": nul("number"),
+        "publish": nul("string", ["queue", "now", "archive", "cancel"]), "publish_when": nul("string"),
+        "unsupported": arr({"type": "string"}), "note": {"type": "string"},
+    }
+    assert set(props) == set(edits.EMPTY), set(props) ^ set(edits.EMPTY)
+    return obj(props)
 
 
 def _client():
@@ -174,85 +193,64 @@ def full_caption(c: dict) -> str:
     return c["caption"].strip() + "\n\n" + " ".join(c["hashtags"])
 
 
-_EDIT_SYSTEM = """Полина присылает правку к смонтированному ролику своими словами (часто голосом).
-Разбери её в структуру. Поля, которые правка не затрагивает, ставь null (remove_phrases пустой список).
-style: "polina" (как у Полины: розовые строчные субтитры сверху), "night" (тёмный, золотые субтитры) или "paper" (светлый, красные акценты).
-remove_phrases: точные фрагменты речи из расшифровки, которые нужно вырезать.
-accents: слова или фразы из расшифровки, которые нужно выделить в субтитрах. Цвета: red (красный),
-gold (золотой), indigo (синий/фиолетовый), green (зелёный), orange (оранжевый), paper (светлый), night (тёмный).
-Шрифты: Oranienbaum (красивый, с засечками, как в заголовках), Jost (простой, рубленый). Не указано → null.
-auto_accents: false, если просит не выделять слова автоматически; true, если вернуть; иначе null.
-bright: true, если просит ярче, сочнее, подкрасить цвет; false, если вернуть как было; иначе null.
-longer: true, если просит ролик подлиннее, резать меньше, оставить паузы; false, если снова резать плотно; иначе null.
-recaption: true, если просит переделать подпись, но сам текст ты не пишешь (обычно ставь caption и null).
-Если просит изменить подпись или заголовок, сразу напиши новый текст в её стиле, по теме ролика и её пожеланию.
-note: одна короткая фраза, что будет сделано."""
+_EDIT_SYSTEM = """Полина или Александр присылают правку к смонтированному ролику своими словами (часто голосом,
+с ошибками распознавания). Разбери её в структуру; в одном сообщении может быть несколько правок, выполни все.
+Поля, которые правка не затрагивает: null, списки пустые. Числа пиши итоговые, с учётом текущих настроек ролика
+(«ещё крупнее» при sub_size 1.2 → 1.44).
+
+Нарезка. cut: tight («короче», «динамичнее», «убери все паузы»), gentle («подлиннее», «оставь паузы»,
+«не режь так сильно»), normal (как обычно). keep_retakes: true — оставить повторные дубли.
+trim_start / trim_end: сколько секунд срезать в начале / в конце готового ролика («начни с 3 секунды» → 3).
+remove_phrases: точные куски речи из расшифровки, которые вырезать («вырежи, где я про погоду» → вся эта фраза
+из расшифровки дословно). restore_phrases: вернуть вырезанное раньше.
+Темп. speed: множитель (1.1 — на 10 % быстрее, 0.9 — медленнее, 1 — как в оригинале).
+Кадр. zoom: off (без зумов), normal, strong (больше зумов). zoom_words: фразы из расшифровки, на которых сделать
+наезд/приближение. mirror: отразить кадр.
+Цвет. color — полный новый список поверх цвета стиля: bright (ярче, сочнее, подкрасить), light (светлее),
+dark (темнее), warm (теплее), cold (холоднее), muted (приглушённее), contrast (контрастнее), bw (весь ролик
+чёрно-белым), natural (без цветокоррекции, как снято). «Цвет как было» → []. Учитывай текущий список.
+Субтитры. subs: false — убрать, true — вернуть. sub_size: множитель размера. sub_pos: top/middle/bottom.
+sub_case: upper (заглавными), lower (строчными), normal. sub_color: цвет текста. sub_font: Oranienbaum
+(красивый, с засечками), Jost (простой). sub_words: сколько слов на экране сразу (1–4).
+fixes: исправить написание слова в субтитрах (from — как в расшифровке, to — как надо).
+accents: выделить слова в субтитрах цветом/шрифтом; auto_accents: false — не выделять автоматически.
+Картинки. no_cards: true — без картинок, false — вернуть. cards_off: слова, на которых убрать картинку.
+card_scale: множитель размера. card_pos: где показывать. card_secs: сколько секунд показывать (обычно 2.2).
+Звук. music: с музыкой или без. music_vol / voice_vol: множитель громкости. denoise: убрать шум.
+sounds: звуковой эффект на фразе из расшифровки. effects: видеоэффект на фразе (bw — чёрно-белая вставка
+только на этом месте). clear: что сбросить целиком («убери все звуки» → sounds).
+Текст в кадре. style: polina (как у Полины), night (тёмный), paper (светлый). title: новый заголовок в начале
+ролика, title_on: показывать ли заголовок. badge: текст плашки ("" — убрать плашку). end_card: финальная заставка.
+Подпись к посту. Если просят изменить подпись, сразу напиши новую в caption (по теме ролика, её пожеланию и
+правилам ниже) и полный список хештегов в её конце не ставь — хештеги отдельно: hashtags_add / hashtags_remove.
+recaption: true только если подпись нужно переписать, а ты её не написал.
+Обложка. cover_text: текст на обложке; cover_at: с какой секунды готового ролика взять кадр.
+Публикация. publish: queue (в очередь на ближайший вечер), now (выложить сейчас), archive, cancel (снять с очереди).
+publish_when: «ГГГГ-ММ-ДД ЧЧ:ММ» по Москве, если назвали время.
+unsupported: по-русски коротко то, чего этими полями сделать нельзя (переставить куски, переходы, стоп-кадр,
+замедленный повтор, новая картинка без файла — попроси прислать фото с подписью «на слово …», другая музыка —
+попроси прислать mp3).
+note: одна короткая фраза по-русски, что будет сделано."""
 
 
 def parse_edit(request: str, words: list[dict], current: dict) -> dict:
+    """Правка в виде словаря edits.EMPTY: через Claude, а без ключа — простым разбором."""
+    from . import edits
+    now = dt.datetime.now(edits.MSK)
     user = (
-        f"Расшифровка:\n{transcript_text(words)}\n\nСейчас заголовок: {current.get('title')}\n"
-        f"Сейчас подпись:\n{current.get('caption')}\n\nПравка Полины: {request}"
+        f"Сейчас {now:%Y-%m-%d %H:%M}, {['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'][now.weekday()]}.\n"
+        f"Расшифровка:\n{transcript_text(words)}\n\nСтиль: {current.get('style')}. "
+        f"Текущие настройки монтажа: {json.dumps(current.get('opts') or {}, ensure_ascii=False)}\n"
+        f"Вырезано вручную: {current.get('removed') or []}\n"
+        f"Сейчас заголовок: {current.get('title')}\nСейчас подпись:\n{current.get('caption')}\n"
+        f"Хештеги: {' '.join(current.get('hashtags') or [])}\n\nПравка: {request}"
     )
-    res = _ask(_EDIT_SYSTEM + "\n\n" + STYLE_GUIDE, user, _EDIT_SCHEMA)
+    res = _ask(_EDIT_SYSTEM + "\n\n" + edits.catalog_for_claude() + "\n\n" + STYLE_GUIDE, user, _edit_schema())
     if res:
-        return res
-    return _parse_edit_simple(request)
-
-
-def _parse_edit_simple(request: str) -> dict:
-    """Запасной разбор без Claude: понимает самые частые просьбы."""
-    r = request.lower()
-    res = {"title": None, "caption": None, "style": None, "badge": None, "music": None,
-           "remove_phrases": [], "no_cards": None, "accents": [], "auto_accents": None,
-           "bright": None, "longer": None, "recaption": None, "note": ""}
-    m = re.search(r"заголов\w*\s*[:—-]?\s*[«\"](.+?)[»\"]", request, re.I)
-    if m:
-        res["title"] = m.group(1)
-    m = re.search(r"подпис\w*\s*[:—-]?\s*[«\"](.+?)[»\"]", request, re.I | re.S)
-    if m:
-        res["caption"] = m.group(1)
-    if "полин" in r:
-        res["style"] = "polina"
-    elif "светл" in r or "бумаг" in r:
-        res["style"] = "paper"
-    elif "тёмн" in r or "темн" in r or "ночн" in r:
-        res["style"] = "night"
-    if "без музык" in r or "убери музык" in r:
-        res["music"] = False
-    elif "музык" in r:
-        res["music"] = True
-    if "без картин" in r or "убери картин" in r:
-        res["no_cards"] = True
-    for m in re.finditer(r"(?:вырежи|убери|удали)\s*[«\"](.+?)[»\"]", request, re.I):
-        res["remove_phrases"].append(m.group(1))
-    colors = {"красн": "red", "золот": "gold", "син": "indigo", "фиолет": "indigo", "зелен": "green",
-              "зелён": "green", "оранж": "orange", "бел": "paper", "светл": "paper"}
-    for m in re.finditer(r"выдел\w*\s*[«\"](.+?)[»\"]([^«\",.;]*)", request, re.I):
-        tail = m.group(2).lower()
-        color = next((v for k, v in colors.items() if k in tail), None)
-        font = "Oranienbaum" if ("засеч" in tail or "красив" in tail) else "Jost" if "прост" in tail else None
-        res["accents"].append({"phrase": m.group(1), "color": color, "font": font})
-    if "не выделяй" in r or "без выделен" in r:
-        res["auto_accents"] = False
-    if any(k in r for k in ("ярч", "ярк", "подкрас", "сочн", "насыщ")):
-        res["bright"] = True
-    if any(k in r for k in ("подлинн", "длиннее", "меньше режь", "меньше вырез", "не режь", "оставь пауз")):
-        res["longer"] = True
-    if "подпис" in r and not res["caption"]:
-        res["recaption"] = True
-    done = []
-    if res["bright"]:
-        done.append("сделаю цвет ярче")
-    if res["longer"]:
-        done.append("оставлю больше пауз, ролик станет длиннее")
-    if res["recaption"]:
-        done.append("перепишу подпись")
-    if done:
-        res["note"] = "Хорошо: " + ", ".join(done) + "."
-        return res
-    res["note"] = "Применяю правку" if any(v for k, v in res.items() if k != "note") else ""
-    return res
+        e = edits.new_edit()
+        e.update(res)
+        return e
+    return edits.parse_simple(request, words, current)
 
 
 def remove_phrases(words: list[dict], phrases: list[str]) -> list[dict]:

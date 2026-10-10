@@ -22,7 +22,7 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from aiohttp import web
 
-from . import captions, instagram, store
+from . import captions, edits, instagram, library, store
 from .edit import make_cover, render
 from .transcribe import load_or_transcribe, transcribe
 
@@ -95,7 +95,10 @@ HELP = (
     "добавлю зумы, картинки, субтитры, обложку и подпись, и пришлю вам на проверку.\n\n"
     "В подписи к видео можно написать пожелание, например «плашка: 14-е лунные сутки» "
     "или «тема: руны на неделю».\n\n"
-    "/plan очередь публикаций\n/stats статистика Instagram\n/style стиль по умолчанию: как у Полины, ночной или светлый\n"
+    "После монтажа правьте ролик текстом или голосом: «динамичнее и ярче», «субтитры снизу», "
+    "«звук бум на слове „казнили“», «выложи завтра в 12». Свою картинку пришлите фото с подписью "
+    "«на слово …», свою музыку пришлите mp3-файлом.\n\n"
+    "/edits все виды правок\n/plan очередь публикаций\n/stats статистика Instagram\n/style стиль по умолчанию: как у Полины, ночной или светлый\n"
     "/pause и /resume остановить или возобновить публикации\n/instagram подключить Instagram\n"
     "/invite код для второго человека"
 )
@@ -223,11 +226,42 @@ def _job_files(job_id: str) -> dict:
             "out": os.path.join(d, "final.mp4"), "cover": os.path.join(d, "cover.jpg")}
 
 
-def _music_file(on: bool):
+def _music_file(on: bool, job: dict | None = None):
     if not on:
         return None
-    files = sorted(glob.glob(os.path.join(MUSIC_DIR, "*.mp3")))
+    for f in ((job or {}).get("music_file"), store.load().get("music_file")):
+        if f and os.path.exists(f):
+            return f
+    files = sorted(glob.glob(os.path.join(library.music_dir(), "*.mp3")) + glob.glob(os.path.join(MUSIC_DIR, "*.mp3")))
     return files[0] if files else None
+
+
+def _resolve_opts(j: dict) -> tuple[dict, list[str]]:
+    """Настройки монтажа ролика с путями к звукам и эффектам (скачиваются при первой просьбе)."""
+    o = dict(j.get("opts") or {})
+    warn = []
+    snd = []
+    for x in o.get("sounds") or []:
+        try:
+            snd.append({"phrase": x["phrase"], "file": library.sound_file(x["sound"]), "vol": 0.5})
+        except Exception as e:
+            log.exception("sound")
+            warn.append(f"звук «{library.SOUNDS.get(x['sound'], ('', x['sound']))[1]}» не скачался ({e})")
+    o["sounds"] = snd
+    fx = []
+    for x in o.get("effects") or []:
+        name = x["effect"]
+        secs = library.EFFECTS[name][3]
+        if name in ("glow", "bw"):
+            fx.append({"phrase": x["phrase"], "type": name, "secs": secs})
+            continue
+        try:
+            fx.append({"phrase": x["phrase"], "type": "clip", "file": library.effect_file(name), "secs": secs})
+        except Exception as e:
+            log.exception("effect")
+            warn.append(f"эффект «{library.EFFECTS[name][1]}» не скачался ({e})")
+    o["effects"] = fx
+    return o, warn
 
 
 def _parse_hint(text: str | None) -> tuple[str | None, str | None]:
@@ -258,19 +292,33 @@ def _build(job_id: str, new_caption: bool, hint: str | None = None):
     else:
         cap = {}
     title = cap.get("title") or j.get("title")
+    opts, warn = _resolve_opts(j)
+    if j.get("music") and not _music_file(True, j):
+        warn.append("музыки пока нет: пришлите боту mp3-файл, и я поставлю его")
     tmp_out = f["out"] + ".tmp.mp4"
-    info = render(f["src"], words, tmp_out, style=j["style"], music=_music_file(j.get("music")),
+    info = render(f["src"], words, tmp_out, style=j["style"], music=_music_file(j.get("music"), j),
                   badge=j.get("badge"), title=title, workdir=f["dir"], cards=not j.get("no_cards"),
                   accents=j.get("accents"), auto_accents=j.get("auto_accents", True),
-                  bright=bool(j.get("bright")), gentle=bool(j.get("gentle")))
+                  extra_cards=[c for c in j.get("extra_cards") or [] if os.path.exists(c["image"])],
+                  bright=bool(j.get("bright")), gentle=bool(j.get("gentle")), opts=opts)
     os.replace(tmp_out, f["out"])
-    make_cover(f["out"], title, f["cover"])
+    _cover(j, f, title)
 
     def put(d):
         d["jobs"][job_id].update(cap)
-        d["jobs"][job_id].update({"status": "review", "duration": info["duration"],
-                                  "cut_seconds": info["cut_seconds"]})
+        # ролик, стоявший в очереди, после правки остаётся в очереди
+        status = "scheduled" if d["jobs"][job_id].get("publish_at") else "review"
+        d["jobs"][job_id].update({"status": status, "duration": info["duration"],
+                                  "cut_seconds": info["cut_seconds"], "warnings": warn})
     store.update(put)
+
+
+def _cover(j: dict, f: dict, title: str | None):
+    at = float(j.get("cover_at") or 0.8)
+    try:
+        make_cover(f["out"], j.get("cover_text") or title or "", f["cover"], at=at)
+    except Exception:
+        make_cover(f["out"], j.get("cover_text") or title or "", f["cover"])
 
 
 def _kb(job_id: str) -> InlineKeyboardMarkup:
@@ -292,6 +340,8 @@ async def _send_preview(chat_id: int, job_id: str):
     text = (f"<b>{html.escape(j['title'])}</b>\n\n{html.escape(captions.full_caption(j))}")
     if j.get("caption_source") == "template":
         text += "\n\n<i>Подпись по шаблону: ключ Claude не подключён.</i>"
+    for w in j.get("warnings") or []:
+        text += f"\n⚠️ {html.escape(w)}"
     await bot.send_message(chat_id, text[:4000], reply_markup=_kb(job_id))
 
 
@@ -370,35 +420,130 @@ async def on_button(cq: CallbackQuery):
     await cq.answer()
     await cq.message.edit_reply_markup(reply_markup=None)
 
-    if action == "q":
-        when = _next_slot()
-        store.update(lambda d: d["jobs"][job_id].update({"status": "scheduled", "publish_at": when}))
-        extra = "" if instagram.connected() else "\nInstagram ещё не подключён: /instagram"
-        await cq.message.answer(f"Поставила в очередь на {_fmt_time(when)} МСК ✅{extra}")
-    elif action == "now":
-        store.update(lambda d: d["jobs"][job_id].update({"status": "scheduled", "publish_at": time.time()}))
-        await cq.message.answer("Публикую…")
-        await _publish_due(force_id=job_id)
-    elif action == "ed":
+    if action == "ed":
         _awaiting_edit[cq.message.chat.id] = job_id
-        await cq.message.answer("Напишите или наговорите голосом, что поправить. Например: "
-                                "«вырежи фразу про погоду», «заголовок: Руны на неделю», «светлый стиль», "
-                                "«выдели слово „новолуние“ красным», "
-                                "«без картинок», «перепиши подпись короче».")
+        await cq.message.answer(EDIT_PROMPT)
     elif action == "st":
         new = {"polina": "night", "night": "paper", "paper": "polina"}.get(j["style"], "polina")
         store.update(lambda d: d["jobs"][job_id].update({"style": new, "status": "processing"}))
         await _process(cq.message.chat.id, job_id, new_caption=False)
-    elif action == "ar":
+    else:
+        await _do_action(cq.message.chat.id, job_id, {"q": "queue", "now": "now", "ar": "archive"}[action])
+
+
+EDIT_PROMPT = ("Напишите или наговорите голосом, что поправить, можно несколько правок сразу. Например: "
+               "«сделай динамичнее и ярче», «вырежи фразу про погоду», «субтитры крупнее и снизу», "
+               "«звук бум на слове „казнили“», «без музыки», «перепиши подпись короче», «выложи завтра в 12». "
+               "Новую картинку пришлите фото с подписью «на слово …». Все варианты: /edits")
+
+
+async def _do_action(chat_id: int, job_id: str, action: str, when: str | None = None):
+    """В очередь / выложить сейчас / в архив / снять с публикации."""
+    if action == "queue":
+        ts = None
+        if when:
+            try:
+                ts = dt.datetime.strptime(when, "%Y-%m-%d %H:%M").replace(tzinfo=MSK).timestamp()
+            except ValueError:
+                ts = None
+            if ts and ts < time.time():
+                ts = None
+        ts = ts or _next_slot()
+        store.update(lambda d: d["jobs"][job_id].update({"status": "scheduled", "publish_at": ts}))
+        extra = "" if instagram.connected() else "\nInstagram ещё не подключён: /instagram"
+        await bot.send_message(chat_id, f"Поставила в очередь на {_fmt_time(ts)} МСК ✅{extra}")
+    elif action == "now":
+        store.update(lambda d: d["jobs"][job_id].update({"status": "scheduled", "publish_at": time.time()}))
+        await bot.send_message(chat_id, "Публикую…")
+        await _publish_due(force_id=job_id)
+    elif action == "archive":
         store.update(lambda d: d["jobs"][job_id].update({"status": "archived", "publish_at": None}))
-        await cq.message.answer("Убрала в архив. Видео сохранено на сервере.")
+        await bot.send_message(chat_id, "Убрала в архив. Видео сохранено на сервере.")
+    elif action == "cancel":
+        store.update(lambda d: d["jobs"][job_id].update({"status": "review", "publish_at": None}))
+        await bot.send_message(chat_id, "Сняла с публикации, ролик ждёт решения.", reply_markup=_kb(job_id))
+
+
+def _target_job(chat_id: int) -> str | None:
+    """Ролик, к которому относится правка: после «Поправить» или последний ждущий решения в этом чате."""
+    job_id = _awaiting_edit.pop(chat_id, None)
+    if job_id:
+        return job_id
+    jobs = [j for j in store.load()["jobs"].values()
+            if j.get("chat_id") == chat_id and j["status"] in ("review", "scheduled", "failed")
+            and time.time() - j.get("created", 0) < 3 * 86400]
+    return max(jobs, key=lambda j: j.get("created", 0))["id"] if jobs else None
+
+
+@dp.message(Command("edits"))
+async def cmd_edits(m: Message):
+    if _allowed(m.from_user.id):
+        await m.answer(html.escape(edits.CATALOG))
+
+
+@dp.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
+async def on_photo(m: Message):
+    """Своя картинка в ролик: фото с подписью «на слово луна»."""
+    if not _allowed(m.from_user.id):
+        return
+    job_id = _target_job(m.chat.id)
+    if not job_id:
+        await m.answer("Сначала пришлите видео, потом картинку к нему с подписью «на слово …».")
+        return
+    phrase = edits._target(m.caption or "") or (m.caption or "").strip()
+    if not phrase:
+        _awaiting_edit[m.chat.id] = job_id
+        await m.answer("Подпишите фото, на каком слове его показать, например «на слово луна», и пришлите ещё раз.")
+        return
+    f = _job_files(job_id)
+    words = load_or_transcribe(f["src"], f["words"])
+    from .edit import find_phrase
+    indexed = [dict(w, i=k) for k, w in enumerate(words)]
+    at = find_phrase(indexed, phrase)
+    if not at:
+        _awaiting_edit[m.chat.id] = job_id
+        await m.answer(f"Не нашла в ролике слово «{html.escape(phrase)}». Напишите его так, как оно звучит, "
+                       "и пришлите фото ещё раз.")
+        return
+    idx = next(w["i"] for w in indexed if w["start"] >= at[0])
+    path = os.path.join(f["dir"], f"photo_{m.message_id}.jpg")
+    await bot.download(m.photo[-1] if m.photo else m.document, destination=path)
+    store.update(lambda d: d["jobs"][job_id].update(
+        {"extra_cards": (d["jobs"][job_id].get("extra_cards") or []) + [{"word": idx, "image": path}],
+         "no_cards": False, "status": "processing"}))
+    await m.answer(f"Хорошо: покажу картинку на «{html.escape(phrase)}».")
+    await _process(m.chat.id, job_id, new_caption=False)
+
+
+@dp.message(F.audio | (F.document & F.document.mime_type.startswith("audio/")))
+async def on_audio(m: Message):
+    """Своя музыка: mp3-файлом. Ставится в последний ролик и запоминается для следующих."""
+    if not _allowed(m.from_user.id):
+        return
+    media = m.audio or m.document
+    name = library.safe_name(getattr(media, "file_name", None) or f"track_{m.message_id}.mp3")
+    if not name.lower().endswith(".mp3"):
+        name += ".mp3"
+    path = os.path.join(library.music_dir(), name)
+    await bot.download(media, destination=path)
+    store.update(lambda d: d.__setitem__("music_file", path))
+    job_id = _target_job(m.chat.id)
+    if not job_id:
+        await m.answer("Музыку сохранила, она будет в следующих роликах.")
+        return
+    store.update(lambda d: d["jobs"][job_id].update({"music_file": path, "music": True, "status": "processing"}))
+    await m.answer("Хорошо: ставлю эту музыку в ролик и запоминаю для следующих.")
+    await _process(m.chat.id, job_id, new_caption=False)
 
 
 @dp.message(F.text | F.voice)
 async def on_text(m: Message):
     if not _allowed(m.from_user.id):
         return
-    job_id = _awaiting_edit.pop(m.chat.id, None)
+    if m.text and m.text.startswith("/"):
+        await m.answer("Такой команды нет. Список: /help, все правки: /edits")
+        return
+    job_id = _target_job(m.chat.id)
     if not job_id:
         await m.answer("Пришлите видео, и я его смонтирую. Список команд: /help")
         return
@@ -414,55 +559,39 @@ async def on_text(m: Message):
     f = _job_files(job_id)
     j = store.load()["jobs"][job_id]
     words = load_or_transcribe(f["src"], f["words"])
+    words = captions.remove_phrases(words, j.get("removed", []))
     e = await asyncio.to_thread(captions.parse_edit, request, words, j)
+    flags = {}
+    store.update(lambda d: flags.update(edits.apply(d["jobs"][job_id], e)))
 
-    def apply(d):
-        jj = d["jobs"][job_id]
-        if e.get("title"):
-            jj["title"] = jj["title_override"] = e["title"]
-        if e.get("caption"):
-            jj["caption"] = e["caption"]
-        for k in ("style", "badge"):
-            if e.get(k):
-                jj[k] = e[k]
-        if e.get("music") is not None:
-            jj["music"] = e["music"]
-        if e.get("no_cards") is not None:
-            jj["no_cards"] = e["no_cards"]
-        if e.get("auto_accents") is not None:
-            jj["auto_accents"] = e["auto_accents"]
-        if e.get("bright") is not None:
-            jj["bright"] = e["bright"]
-        if e.get("longer") is not None:
-            jj["gentle"] = e["longer"]
-        if e.get("recaption"):
-            jj["caption"] = None
-        jj["accents"] = jj.get("accents", []) + e.get("accents", [])
-        jj["removed"] = jj.get("removed", []) + e.get("remove_phrases", [])
-        jj["status"] = "processing"
-    store.update(apply)
-    if e.get("note"):
-        await m.answer(html.escape(e["note"]))
-    only_text = not any(e.get(k) is not None and e.get(k) != [] for k in
-                        ("title", "style", "badge", "music", "no_cards", "remove_phrases", "accents", "auto_accents",
-                         "bright", "longer"))
-    if only_text and e.get("recaption") and not e.get("caption"):
-        # подпись переписываем по пожеланию, видео не трогаем
-        c = await asyncio.to_thread(captions.make_caption, captions.remove_phrases(words, j.get("removed", [])),
-                                    j.get("badge"), request)
-        store.update(lambda d: d["jobs"][job_id].update({"caption": c["caption"], "hashtags": c["hashtags"],
-                                                         "caption_source": c["source"], "status": "review"}))
-        await _send_preview(m.chat.id, job_id)
-    elif only_text and e.get("caption"):
-        store.update(lambda d: d["jobs"][job_id].__setitem__("status", "review"))
-        await _send_preview(m.chat.id, job_id)
-    elif only_text:
-        store.update(lambda d: d["jobs"][job_id].__setitem__("status", "review"))
+    said = edits.summary(e)
+    if said:
+        await m.answer("Хорошо: " + html.escape("; ".join(said)) + ".")
+    if e.get("unsupported"):
+        await m.answer("Пока не умею: " + html.escape("; ".join(e["unsupported"])) + ".")
+    if not said:
         _awaiting_edit[m.chat.id] = job_id
-        await m.answer("Не поняла, что поменять. Попробуйте сказать иначе.")
-    else:
-        await _process(m.chat.id, job_id, new_caption=bool(e.get("recaption") and not e.get("caption")),
-                       hint=request if e.get("recaption") else None)
+        if not e.get("unsupported"):
+            await m.answer("Не поняла, что поменять. Скажите иначе или посмотрите примеры: /edits")
+        return
+
+    if flags["render"]:
+        store.update(lambda d: d["jobs"][job_id].__setitem__("status", "processing"))
+        await _process(m.chat.id, job_id, new_caption=flags["recaption"], hint=request if flags["recaption"] else None)
+    elif flags["recaption"]:
+        jj = store.load()["jobs"][job_id]
+        c = await asyncio.to_thread(captions.make_caption, words, jj.get("badge"), request)
+        store.update(lambda d: d["jobs"][job_id].update({"caption": c["caption"], "hashtags": c["hashtags"],
+                                                         "caption_source": c["source"]}))
+        await _send_preview(m.chat.id, job_id)
+    elif flags["cover"]:
+        jj = store.load()["jobs"][job_id]
+        await asyncio.to_thread(_cover, jj, f, jj.get("title"))
+        await _send_preview(m.chat.id, job_id)
+    elif not flags["publish"]:
+        await _send_preview(m.chat.id, job_id)
+    if flags["publish"] and store.load()["jobs"][job_id]["status"] != "failed":
+        await _do_action(m.chat.id, job_id, flags["publish"], flags.get("when"))
 
 
 # ───────────────────────── публикация по расписанию ─────────────────────────

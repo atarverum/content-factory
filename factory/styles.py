@@ -51,6 +51,7 @@ STYLES = {
 STYLES["polina"] = {
     "title": "Как у Полины",
     "end_card": False,  # Полина не ставит финальную заставку
+    "card_pos": "bottom",  # картинки внизу кадра, сверху её субтитры
     "font": "Jost",
     "font_size": 124,
     "uppercase": False,
