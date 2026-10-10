@@ -66,6 +66,7 @@ $1:$CADDY_PORT {
 		# Happ сам обновляет подписку раз в час.
 		header Content-Type "application/json; charset=utf-8"
 		header profile-update-interval "1"
+		header profile-title "base64:4ZqxIFZQTiDQoNCw0LnQtNC+"
 		root * /etc/xray-sub
 		file_server
 	}
@@ -323,7 +324,7 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
                     "realitySettings": {"serverName": sni, "fingerprint": "chrome",
                         "publicKey": pub, "shortId": sid}}}
     conf = {
-        "remarks": "Наш VPN · авто",
+        "remarks": "ᚱ VPN Райдо",
         "dns": {"servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
                 "queryStrategy": "UseIPv4"},
         "inbounds": [
@@ -351,7 +352,7 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
     print(token, name)
 PY
       chmod 755 /etc/xray-sub; chmod 644 /etc/xray-sub/*
-      if ! grep -q 'profile-update-interval' /etc/caddy/Caddyfile; then
+      if ! grep -q 'profile-title' /etc/caddy/Caddyfile; then
         cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.before-sub
         write_caddyfile "$DOMAIN"
         caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
