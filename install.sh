@@ -119,7 +119,7 @@ ${IP//./-}.sslip.io:8444 {
 		# Happ сам обновляет подписку раз в час.
 		header Content-Type "application/json; charset=utf-8"
 		header profile-update-interval "1"
-		header profile-title "base64:4ZqxIFZQTiDQoNCw0LnQtNC+"
+		header profile-title "base64:4ZqxIFJhaWRvIFZQTg=="
 		root * /etc/xray-sub
 		file_server
 	}
