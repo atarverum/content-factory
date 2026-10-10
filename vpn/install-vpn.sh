@@ -134,7 +134,34 @@ PY
       move_to_443
       say "Готово. Старые ключи больше не работают, вот новые:"
       exec bash "$0" show ;;
-    *) die "неизвестная команда: $1 (есть show, add и move443)" ;;
+    sni)
+      # Под какой сайт маскируется VPN. «self» = под сайт фабрики (по умолчанию, сайт работает).
+      # Чужой сайт (например www.microsoft.com): провайдеру трафик виден как заход на него,
+      # но сайт фабрики на это время не открывается, потому что посетителей Xray отправляет туда.
+      [ "$PORT" = 443 ] || die "сначала: bash install-vpn.sh move443"
+      TARGET="${2:-}"; [ -n "$TARGET" ] || die "укажите сайт: bash install-vpn.sh sni www.microsoft.com (или self)"
+      DOMAIN="${IP//./-}.sslip.io"
+      if [ "$TARGET" = self ]; then TARGET=$DOMAIN; DEST="127.0.0.1:$CADDY_PORT"; else DEST="$TARGET:443"; fi
+      if [ "$TARGET" != "$DOMAIN" ]; then
+        curl -sI -m 10 "https://$TARGET" >/dev/null || die "сервер не может открыть https://$TARGET, выберите другой сайт"
+      fi
+      python3 - "$CFG" "$TARGET" "$DEST" <<'PY'
+import json, sys
+p, sni, dest = sys.argv[1:]
+cfg = json.load(open(p))
+r = cfg["inbounds"][0]["streamSettings"]["realitySettings"]
+r["dest"] = dest
+r["serverNames"] = [sni]
+json.dump(cfg, open(p, "w"), indent=2)
+PY
+      sed -i "s/^SNI=.*/SNI=$TARGET/" "$STATE"
+      xray run -test -config "$CFG" >/dev/null || die "Xray не принял настройки"
+      systemctl restart xray
+      say "VPN теперь маскируется под $TARGET"
+      echo "В Happ откройте сервер и в поле «Имя сервера» впишите: $TARGET"
+      [ "$TARGET" = "$DOMAIN" ] || echo "Сайт фабрики сейчас не открывается. Вернуть: bash install-vpn.sh sni self"
+      exit 0 ;;
+    *) die "неизвестная команда: $1 (есть show, add, move443 и sni)" ;;
   esac
 fi
 
