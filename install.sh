@@ -27,13 +27,34 @@ getenv() { [ -f "$ENV" ] && grep "^$1=" "$ENV" | head -1 | cut -d= -f2- || true;
 
 say "Ставлю системные программы (ffmpeg, python, caddy)"
 export DEBIAN_FRONTEND=noninteractive
+# Старый репозиторий Caddy (cloudsmith) стал платным и ломает apt update: убираем его, Caddy есть в Ubuntu.
+rm -f /etc/apt/sources.list.d/caddy-stable.list
 apt-get update -qq
 apt-get install -y -qq ffmpeg python3-venv python3-pip git curl ca-certificates debian-keyring debian-archive-keyring apt-transport-https gnupg >/dev/null
 if ! command -v caddy >/dev/null; then
-  curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
-  apt-get update -qq && apt-get install -y -qq caddy >/dev/null
+  apt-get install -y -qq caddy >/dev/null 2>&1 || {
+    # В Ubuntu 22.04 Caddy нет в стандартных репозиториях: берём готовую программу с сайта Caddy.
+    curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=$(dpkg --print-architecture)" -o /usr/bin/caddy
+    chmod +x /usr/bin/caddy
+    id caddy >/dev/null 2>&1 || useradd --system --home /var/lib/caddy --create-home --shell /usr/sbin/nologin caddy
+    mkdir -p /etc/caddy
+    cat > /etc/systemd/system/caddy.service <<'UNIT'
+[Unit]
+Description=Caddy
+After=network-online.target
+[Service]
+User=caddy
+ExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=always
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload && systemctl enable -q caddy
+  }
 fi
+mkdir -p /etc/caddy
 
 # Распознаванию речи нужно ~2 ГБ памяти: на маленьком сервере добавим файл подкачки.
 if [ "$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)" -lt 3500 ] && ! swapon --show | grep -q /swapfile; then
