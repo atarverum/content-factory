@@ -327,6 +327,9 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
                         "publicKey": pub, "shortId": sid}}}
     conf = {
         "remarks": "🇳🇱 Raido NL",
+        # Без своего DNS на iPhone VPN не стартует: запросы зацикливаются в туннеле.
+        "dns": {"servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
+                "queryStrategy": "UseIPv4"},
         "inbounds": [
             {"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
              "settings": {"auth": "noauth", "udp": True}, "sniffing": sniff},
