@@ -18,7 +18,7 @@ EMPTY = {
     # «больше ничего не делай»: только субтитры и цвет, без нарезки, картинок, музыки, заголовка, заставки
     "minimal": None,
     # нарезка
-    "cut": None, "smooth": [], "keep_retakes": None, "trim_start": None, "trim_end": None,
+    "cut": None, "smooth": [], "unclip": [], "keep_retakes": None, "trim_start": None, "trim_end": None,
     "remove_phrases": [], "restore_phrases": [],
     # темп и кадр
     "speed": None, "zoom": None, "zoom_words": [], "mirror": None,
@@ -29,11 +29,13 @@ EMPTY = {
     "sub_words": None, "fixes": [], "accents": [], "auto_accents": None,
     # картинки
     "no_cards": None, "card_scale": None, "card_pos": None, "card_secs": None, "cards_off": [],
+    # новые картинки из фотобанка: [{"phrase": слово из речи, "query": что искать}]
+    "images": [],
     # звук
     "music": None, "music_vol": None, "voice_vol": None, "denoise": None, "sounds": [],
     # эффекты
     "effects": [],
-    # что очистить целиком: sounds, effects, zoom_words, accents, cards_off, fixes, removed, color
+    # что очистить целиком: sounds, effects, zoom_words, accents, cards_off, fixes, removed, color, images
     "clear": [],
     # текст в кадре
     "style": None, "title": None, "title_on": None, "badge": None, "end_card": None,
@@ -52,7 +54,7 @@ EMPTY = {
 OPT_KEYS = ["sub_shift", "cut", "keep_retakes", "trim_start", "trim_end", "speed", "zoom", "mirror", "color", "subs", "sub_size",
             "sub_pos", "sub_case", "sub_color", "sub_font", "sub_words", "card_scale", "card_pos", "card_secs",
             "music_vol", "voice_vol", "denoise", "end_card", "title_on"]
-LIST_OPTS = ["zoom_words", "cards_off", "fixes", "sounds", "effects", "smooth"]
+LIST_OPTS = ["zoom_words", "cards_off", "fixes", "sounds", "effects", "smooth", "unclip"]
 
 # Жанры: с чего начинается монтаж. Правки поверх жанра сохраняются, смена жанра сбрасывает его настройки.
 GENRES = {
@@ -187,6 +189,7 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
         e["cta"] = False
     elif re.search(r"(?:добавь|верни|постав\w*)\s(?:\w+\s){0,3}(?:ссылк|телеграм|призыв)", whole):
         e["cta"] = True
+    request = _pull_fixes(request, e)
     for raw in _clauses(request):
         c = _n(raw)
         q = _quoted(raw)
@@ -345,12 +348,25 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
         if re.search(r"картин|мем|фото|изображ|карточк|иллюстрац", c):
             if neg and tgt:
                 e["cards_off"].append(tgt)
+            elif neg and re.search(r"нов|добавленн|найденн", c):
+                e["clear"].append("images")
             elif neg:
                 e["no_cards"] = True
             elif "верни" in c:
                 e["no_cards"] = False
-            elif re.search(r"чаще|побольше картин|больше картин|больше мем|добав|встав|постав", c):
-                e["unsupported"].append("новая картинка: пришлите её боту фото с подписью «на слово …»")
+            elif re.search(r"чаще|побольше картин|больше картин|больше мем|добав|встав|постав|найди|покажи", c):
+                at = _target(raw)
+                m2 = re.search(r"(?:картинк\w*|фото\w*|изображени\w*|иллюстрац\w*)\s+(?:с\s+|со\s+)?([\wё-]+(?:\s+[\wё-]+)?)", c)
+                what = m2.group(1) if m2 else None
+                if what and re.match(r"(?:на|в|где|когда|после|про)\b", what):
+                    what = None
+                if what:
+                    what = re.split(r"\s+(?:на|в|где|когда|после)\b", what)[0]
+                if at or what:
+                    e["images"].append({"phrase": at or what, "query": what or at})
+                else:
+                    e["unsupported"].append("новая картинка: скажите, что на ней и на каком слове, или пришлите фото "
+                                            "с подписью «на слово …»")
             if re.search(r"крупн|увелич|больше размер|побольше размер", c) or (re.search(r"\bбольше\b", c) and not add):
                 e["card_scale"] = round(float(o.get("card_scale") or 1.0) * 1.25, 2)
             elif re.search(r"мельч|меньш|уменьш", c):
@@ -453,7 +469,18 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
             sec = _num(c)
             e["trim_end"] = sec if sec is not None and sec < 60 else 2.0
             continue
-        if re.search(r"склейк|перемонтир|плавн|резк\w* (?:переход|обрыв)|дерга|обрыв|обрезан\w* слов|оборва", c):
+        if re.search(r"обрез\w*|оборва\w*|обрыва\w*|съел\w*|съеда\w*|отрезал\w*|не договар|недоговор|проглот", c) and \
+                re.search(r"слов|фраз|начал|конец|окончан|букв|на\s|[«\"]", c) and not re.search(r"секунд|кадр|видео в начал", c):
+            ut = q[0] if q else _target(raw, loose=True)
+            if not ut:
+                m2 = re.search(r"(?:слово|фразу|слова)\s+([\wё-]+(?:\s+[\wё-]+){0,2})", c)
+                ut = m2.group(1) if m2 else None
+            if ut:
+                e["unclip"].append(ut)
+            else:
+                e["cut"] = e["cut"] or "gentle"  # слово не назвали — режем мягче везде
+            continue
+        if re.search(r"склейк|перемонтир|плавн|резк\w* (?:переход|обрыв)|дерга|обрыв", c):
             st = _target(raw)
             if st:
                 e["smooth"].append(st)
@@ -572,6 +599,31 @@ def parse_simple(request: str, words: list[dict], job: dict) -> dict:
     return e
 
 
+_W = r"[«\"“„']?([\wё-]+(?:\s+[\wё-]+){0,2}?)[»\"”“']?"
+_FIX_PATTERNS = [
+    # «исправь слово блаватская на Блаватская», «замени „таро“ на „Таро“»
+    r"(?:исправ\w*|замени\w*|поменяй|перепиши|напиши)\s+(?:в\s+субтитрах\s+)?(?:слово\s+|написание\s+)?" + _W + r"\s+на\s+" + _W + r"(?=$|[\s.,;!?])",
+    # «там написано блаватская, а надо Блаватская», «написано X, а правильно Y»
+    r"(?:написан\w*|пишется|в субтитрах)\s+" + _W + r"\s*,?\s+а\s+(?:надо|нужно|правильно|должно быть)\s+" + _W + r"(?=$|[\s.,;!?])",
+    # «не блаватская, а Блаватская»
+    r"\bне\s+" + _W + r"\s*,\s*а\s+" + _W + r"(?=$|[.,;!?])",
+]
+
+
+def _pull_fixes(request: str, e: dict) -> str:
+    """Исправления написания в субтитрах без кавычек. Возвращает просьбу без этих кусков."""
+    for pat in _FIX_PATTERNS:
+        for m in list(re.finditer(pat, request, flags=re.I)):
+            a, b = m.group(1).strip(), m.group(2).strip()
+            if _n(a) == _n(b) and a == b:
+                continue
+            if re.search(r"шрифт|цвет|субтитр|титр|картин|фото|музык|трек|жанр|стил|сверху|снизу|подпис|заголов|обложк|плашк|темп|зум|звук|эффект|хе?ш|время|завтра|сегодня|\d", _n(a + " " + b)):
+                continue  # «поменяй шрифт на рукописный» — это не исправление слова
+            e["fixes"].append({"from": a, "to": b})
+            request = request.replace(m.group(0), " ")
+    return request
+
+
 def _sentence_with(words: list[dict], phrase: str) -> str:
     """Фраза из расшифровки (от паузы или точки до паузы или точки), где звучит phrase."""
     from .edit import find_phrase
@@ -589,7 +641,7 @@ def _sentence_with(words: list[dict], phrase: str) -> str:
 
 
 def _dedup(e: dict):
-    for k in ("clear", "remove_phrases", "restore_phrases", "zoom_words", "cards_off", "unsupported",
+    for k in ("clear", "remove_phrases", "restore_phrases", "zoom_words", "cards_off", "unsupported", "unclip",
               "hashtags_add", "hashtags_remove"):
         seen, out = set(), []
         for x in e[k]:
@@ -600,6 +652,11 @@ def _dedup(e: dict):
 
 
 def _pos(c: str):
+    # «перенеси сверху вниз» — важно, куда, а не откуда
+    m = re.search(r"\b(?:с|со)\s+(?:верх\w*|сверху|низ\w*|снизу|центр\w*|середин\w*)\s+(?:на\s+|в\s+)?(\w+)", c) or \
+        re.search(r"\b(?:сверху|снизу)\s+(?:на\s+|в\s+)?(вниз|низ\w*|наверх|вверх|верх\w*|центр\w*|середин\w*)", c)
+    if m:
+        c = m.group(1)
     if re.search(r"сверху|наверх|вверх|верх", c):
         return "top"
     if re.search(r"снизу|вниз|низ", c):
@@ -674,6 +731,9 @@ def apply(job: dict, e: dict) -> dict:
         elif k == "color":
             o["color"] = []
             render = True
+        elif k == "images":
+            job["images"] = []
+            render = True
         elif k in LIST_OPTS:
             o[k] = []
             render = True
@@ -686,7 +746,7 @@ def apply(job: dict, e: dict) -> dict:
         job.pop("bright", None)
     if e.get("cut") is not None:
         job.pop("gentle", None)
-    for k in ("zoom_words", "cards_off", "smooth"):
+    for k in ("zoom_words", "cards_off", "smooth", "unclip"):
         if e.get(k):
             o[k] = list(dict.fromkeys((o.get(k) or []) + e[k]))
             render = True
@@ -714,6 +774,11 @@ def apply(job: dict, e: dict) -> dict:
         render = True
     if e.get("accents"):
         job["accents"] = (job.get("accents") or []) + e["accents"]
+        render = True
+    if e.get("images"):
+        new = [{"phrase": x["phrase"], "query": x.get("query") or x["phrase"]} for x in e["images"] if x.get("phrase")]
+        same = {_n(x["phrase"]) for x in new}  # на том же слове новая картинка заменяет прежнюю
+        job["images"] = [x for x in job.get("images") or [] if _n(x["phrase"]) not in same] + new
         render = True
     for k in ("style", "music", "no_cards", "auto_accents"):
         if e.get(k) is not None:
@@ -758,6 +823,8 @@ def summary(e: dict) -> list[str]:
         s.append(cut[e["cut"]])
     for p in e.get("smooth") or []:
         s.append(f"после «{p}» склейка плавнее, паузу оставлю")
+    for p in e.get("unclip") or []:
+        s.append(f"не буду обрезать «{p}»")
     if e.get("keep_retakes") is True:
         s.append("оставлю повторные дубли")
     if e.get("trim_start"):
@@ -792,7 +859,7 @@ def summary(e: dict) -> list[str]:
     if e.get("sub_case"):
         s.append({"upper": "субтитры заглавными", "lower": "субтитры строчными", "normal": "субтитры обычным регистром"}[e["sub_case"]])
     if e.get("sub_color"):
-        s.append(f"субтитры {COLOR_NAMES.get(e['sub_color'], e['sub_color'])}")
+        s.append(f"цвет субтитров: {COLOR_NAMES.get(e['sub_color'], e['sub_color'])}")
     if e.get("sub_font"):
         s.append(f"шрифт {e['sub_font']}")
     if e.get("sub_words"):
@@ -809,6 +876,8 @@ def summary(e: dict) -> list[str]:
         s.append("верну картинки")
     for p in e.get("cards_off") or []:
         s.append(f"уберу картинку на «{p}»")
+    for x in e.get("images") or []:
+        s.append(f"найду картинку «{x.get('query') or x['phrase']}» и покажу на «{x['phrase']}»")
     if e.get("card_scale"):
         s.append(f"картинки {'крупнее' if e['card_scale'] > 1 else 'мельче'}")
     if e.get("card_pos"):
@@ -832,7 +901,8 @@ def summary(e: dict) -> list[str]:
         if x.get("effect") in library.EFFECTS:
             s.append(f"эффект «{library.EFFECTS[x['effect']][1]}» на «{x['phrase']}»")
     names = {"sounds": "звуки", "effects": "эффекты", "zoom_words": "наезды", "cards_off": "убранные картинки",
-             "accents": "выделения", "fixes": "исправления", "removed": "вырезанные фразы", "color": "цвет"}
+             "accents": "выделения", "fixes": "исправления", "removed": "вырезанные фразы", "color": "цвет",
+             "images": "найденные картинки"}
     for k in e.get("clear") or []:
         if k == "removed":
             s.append("верну всё вырезанное вручную")
@@ -879,12 +949,12 @@ CATALOG = """Что можно попросить (текстом или гол�
 
 🎭 Жанр: «это рассказ» (как ролики Полины про религии и историю: нарезка, картинки, выделения), «это влог из путешествия» / «зарисовка» (ролик целиком, без вырезаний и картинок, только субтитры), «это скетч» / «комедия» (плотная нарезка, без картинок). «Больше ничего не делай, только субтитры» — ролик целиком, только субтитры и цвет.
 
-✂️ Нарезка: «сделай короче / динамичнее», «подлиннее, оставь паузы», «от начала до конца, ничего не вырезай», «после слов „смотрите какой вид“ резкая склейка, сделай плавнее», «вырежи „ну короче“», «верни фразу „про луну“», «оставь дубли», «обрежь 3 секунды в начале», «убери последние 2 секунды»
+✂️ Нарезка: «ты обрезал слово „море“» (склейку у этого слова уберу), «сделай короче / динамичнее», «подлиннее, оставь паузы», «от начала до конца, ничего не вырезай», «после слов „смотрите какой вид“ резкая склейка, сделай плавнее», «вырежи „ну короче“», «верни фразу „про луну“», «оставь дубли», «обрежь 3 секунды в начале», «убери последние 2 секунды»
 ⏩ Темп: «быстрее», «медленнее», «ускорь в 1.2 раза», «темп как было»
 🔍 Кадр: «без зумов», «больше зумов», «наезд на слове „мошенница“», «отрази кадр»
 🎨 Цвет: «ярче», «темнее», «светлее», «теплее», «холоднее», «приглуши», «контрастнее», «чёрно-белое», «без цветокоррекции», «цвет как было»
 💬 Субтитры: «убери субтитры», «субтитры крупнее / мельче», «субтитры снизу / сверху / по центру», «субтитры выше / чуть ниже», «чтобы субтитры были одни», «заглавными / строчными», «субтитры белым», «шрифт рукописный / с засечками / современный / мягкий / спортивный / элегантный / ретро», «поменяй шрифт», «поменяй цвет субтитров», «по одному слову», «исправь „блаватская“ на „Блаватская“», «выдели „новолуние“ красным», «не выделяй слова»
-🖼 Картинки: «без картинок», «убери картинку на слове „луна“», «картинки крупнее / мельче», «картинки снизу / сверху», «показывай картинки дольше»; новую картинку пришлите фото с подписью «на слово …»
+🖼 Картинки: «без картинок», «убери картинку на слове „луна“», «картинки крупнее / мельче», «картинки снизу / сверху», «показывай картинки дольше», «добавь картинку Эйфелевой башни на слове „Париж“» (найду в фотобанке); свою картинку пришлите фото с подписью «на слово …»
 🔊 Звук: «без музыки», «музыка тише / громче», «голос громче», «убери шум», «звук бум на слове „казнили“», «ба-дум-тсс на „шутка“», «убери звуки»; свою музыку пришлите mp3-файлом
 ✨ Эффекты: «молния на „мошенница“», «искры на слове „огонь“», «дым», «засвет», «глитч», «звёздочки», «свечение», «чёрно-белая вставка на „скучно“», «убери эффекты»
 🏷 Текст в кадре: «заголовок: „Руны на неделю“», «без заголовка», «плашка: „14-е лунные сутки“», «убери плашку», «добавь финальную заставку», «стиль как у Полины / светлый / ночной»

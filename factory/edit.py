@@ -20,8 +20,8 @@ IMAGES = os.path.join(HERE, "assets", "images")
 
 W, H, FPS = 1080, 1920, 30
 MAX_GAP = 0.40       # паузы длиннее вырезаем
-PAD_BEFORE = 0.08
-PAD_AFTER = 0.16
+PAD_BEFORE = 0.12
+PAD_AFTER = 0.22
 RETAKE_GAP = 0.9     # пауза, после которой ищем повторный дубль
 CARD_SECONDS = 2.2
 END_SECONDS = 2.4
@@ -62,7 +62,7 @@ def _drop_retakes(phrases):
         if kept:
             prev = [_norm(w["word"]) for w in kept[-1][:2]]
             cur = [_norm(w["word"]) for w in ph[:2]]
-            if len(prev) == 2 and prev == cur:
+            if len(prev) == 2 and prev == cur and not any(w.get("keep") for w in kept[-1]):
                 kept.pop()
         kept.append(ph)
     return kept
@@ -86,7 +86,7 @@ def plan_cuts(words, duration, gentle=False, cut=None, keep_retakes=False):
     if cut == "none":
         return [(0.0, duration)], [dict(w, seg=0) for w in words if w["start"] < duration]
     max_gap, pad_before, pad_after = CUTS[cut]
-    words = [w for w in words if _norm(w["word"]) not in FILLERS]
+    words = [w for w in words if w.get("keep") or _norm(w["word"]) not in FILLERS]
     if not keep_retakes:
         words = [w for ph in _drop_retakes(_phrases(words)) for w in ph]
     if not words:
@@ -102,8 +102,9 @@ def plan_cuts(words, duration, gentle=False, cut=None, keep_retakes=False):
 
     segments, new_words, t_out, prev_end = [], [], 0.0, 0.0
     for gi, g in enumerate(groups):
-        s = max(prev_end, g[0]["start"] - pad_before, 0.0)
-        e = min(duration, g[-1]["end"] + pad_after)
+        # «ты обрезал слово»: у такого слова запас больше (распознавание часто ставит границы слова неточно)
+        s = max(prev_end, g[0]["start"] - pad_before - (0.25 if g[0].get("keep") else 0.0), 0.0)
+        e = min(duration, g[-1]["end"] + pad_after + (0.35 if g[-1].get("keep") else 0.0))
         if gi + 1 < len(groups):
             e = min(e, groups[gi + 1][0]["start"] - 0.02)
         if e - s < 0.15:
@@ -182,6 +183,22 @@ def mark_smooth(words, phrases):
                 out[i + n - 1]["nocut"] = True
                 if i + n < len(out):  # и пауза перед следующей фразой тоже остаётся
                     out[i + n]["nocut_before"] = True
+    return out
+
+
+def mark_unclip(words, phrases):
+    """«Ты обрезал слово X»: слово X не режем ни до, ни после, не считаем паразитом или дублем, оставляем запас."""
+    out = [dict(w) for w in words]
+    for ph in phrases or []:
+        target = [t for t in re.findall(r"[\wё-]+", ph) if _norm(t)]
+        n = len(target)
+        for i in range(len(out) - n + 1):
+            if n and all(same_word(out[i + k]["word"], target[k]) for k in range(n)):
+                for k in range(n):
+                    out[i + k]["keep"] = True
+                    out[i + k]["nocut"] = True
+                if i > 0:
+                    out[i - 1]["nocut"] = True
     return out
 
 
@@ -495,6 +512,7 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
     words = [dict(w, i=w.get("i", k)) for k, w in enumerate(words)]
     words = apply_fixes(words, o.get("fixes"))
     words = mark_smooth(words, o.get("smooth"))
+    words = mark_unclip(words, o.get("unclip"))
     words = mark_accents(words, accents, auto_accents)
     work = workdir or tempfile.mkdtemp(prefix="factory_")
     os.makedirs(work, exist_ok=True)
@@ -542,7 +560,10 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
     for i, c in enumerate(cards):
         c["png"] = os.path.join(work, f"card{i}.png")
         make_card(c["image"], c["png"], st["card_border"], scale=float(o.get("card_scale") or 1.0))
-    card_y = {"top": "200", "middle": "(H-h)/2", "bottom": "H-h-260"}[o.get("card_pos") or st.get("card_pos", "top")]
+    card_pos = o.get("card_pos") or st.get("card_pos", "top")
+    if not o.get("card_pos") and st.get("align") == card_pos and card_pos in ("top", "bottom"):
+        card_pos = "top" if card_pos == "bottom" else "bottom"  # субтитры перенесли туда, где картинки: картинки уходят на другой край
+    card_y = {"top": "200", "middle": "(H-h)/2", "bottom": "H-h-260"}[card_pos]
 
     ass_path = os.path.join(work, "subs.ass")
     with open(ass_path, "w", encoding="utf-8") as f:
@@ -604,6 +625,8 @@ def render(src, words, out_path, style="night", music=None, badge=None, title=No
     grade += "".join("," + COLOR_FILTERS[c] for c in colors if c in COLOR_FILTERS)
     fc.append(
         f"[vc]{f'setpts=PTS/{speed},' if speed != 1.0 else ''}fps={FPS},"
+        # сначала квадратные пиксели (у некоторых телефонных видео они вытянутые), потом вписываем в 1080x1920
+        f"scale='trunc(iw*sar/2)*2':ih,setsar=1,"
         f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,{'hflip,' if o.get('mirror') else ''}"
         f"zoompan=z='{_zoom_expr2(seg_durs, base_zoom, punches)}':x='iw/2-(iw/zoom/2)':y='ih*0.4-(ih/zoom*0.4)':d=1:s={W}x{H}:fps={FPS},"
         f"{grade}[v_base]"

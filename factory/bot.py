@@ -278,6 +278,25 @@ def _resolve_opts(j: dict) -> tuple[dict, list[str]]:
     return o, warn
 
 
+def _image_cards(j: dict, words: list[dict], warn: list[str]) -> list[dict]:
+    """Картинки, которые попросили найти («картинку кота на слове кот»): скачиваем и ставим на слово."""
+    from .edit import find_phrase
+    out = []
+    for x in j.get("images") or []:
+        at = find_phrase(words, x["phrase"])
+        if not at:
+            warn.append(f"не нашла в ролике слово «{x['phrase']}» для картинки")
+            continue
+        idx = next(w["i"] for w in words if w["start"] >= at[0])
+        try:
+            out.append({"word": idx, "image": library.image_file(x.get("query") or x["phrase"])})
+        except Exception as e:
+            log.exception("image")
+            warn.append(f"картинка «{x.get('query') or x['phrase']}» не нашлась ({e}); можно прислать фото "
+                        f"с подписью «на слово {x['phrase']}»")
+    return out
+
+
 def _parse_hint(text: str | None) -> tuple[str | None, str | None]:
     """Из подписи к видео достаём «плашка: …», остальное идёт пожеланием к подписи."""
     if not text:
@@ -297,7 +316,8 @@ def _build(job_id: str, new_caption: bool, hint: str | None = None):
     """Тяжёлая часть, выполняется в отдельном потоке."""
     j = store.load()["jobs"][job_id]
     f = _job_files(job_id)
-    words = load_or_transcribe(f["src"], f["words"])
+    # номер слова в исходной расшифровке (i) сохраняем: по нему картинки встают на свои слова и после вырезаний
+    words = [dict(w, i=k) for k, w in enumerate(load_or_transcribe(f["src"], f["words"]))]
     words = captions.remove_phrases(words, j.get("removed", []))
     if new_caption or not j.get("caption"):
         c = captions.make_caption(words, j.get("badge"), hint, cta=_job_flag(j, "cta", True), genre=j.get("genre"))
@@ -307,13 +327,16 @@ def _build(job_id: str, new_caption: bool, hint: str | None = None):
         cap = {}
     title = cap.get("title") or j.get("title")
     opts, warn = _resolve_opts(j)
+    extra = [c for c in j.get("extra_cards") or [] if os.path.exists(c["image"])] + _image_cards(j, words, warn)
+    no_cards = _job_flag(j, "no_cards", False)
     if j.get("music") and not _music_file(True, j):
         warn.append("музыки пока нет: пришлите боту mp3-файл, и я поставлю его")
     tmp_out = f["out"] + ".tmp.mp4"
     info = render(f["src"], words, tmp_out, style=j["style"], music=_music_file(j.get("music"), j),
-                  badge=j.get("badge"), title=title, workdir=f["dir"], cards=not _job_flag(j, "no_cards", False),
+                  badge=j.get("badge"), title=title, workdir=f["dir"], cards=bool(extra) or not no_cards,
+                  auto_cards=not no_cards,  # во влоге свои картинки показываем, а автоматические нет
                   accents=j.get("accents"), auto_accents=_job_flag(j, "auto_accents", True),
-                  extra_cards=[c for c in j.get("extra_cards") or [] if os.path.exists(c["image"])],
+                  extra_cards=extra,
                   bright=bool(j.get("bright")), gentle=bool(j.get("gentle")), opts=opts)
     os.replace(tmp_out, f["out"])
     _cover(j, f, title)
@@ -361,8 +384,9 @@ GENRE_QUESTION = ("Что это за ролик?\n🎓 Рассказ: монт
 async def _send_preview(chat_id: int, job_id: str):
     j = store.load()["jobs"][job_id]
     f = _job_files(job_id)
+    # без размеров Telegram иногда показывает вертикальный ролик квадратом
     await bot.send_video(chat_id, FSInputFile(f["out"]), cover=FSInputFile(f["cover"]),
-                         supports_streaming=True,
+                         supports_streaming=True, width=1080, height=1920, duration=int(round(j.get("duration") or 0)) or None,
                          caption=f"{_genre(j)['name']} · {STYLE_NAMES[j['style']]} стиль · {j['duration']:.0f} с · "
                                  f"вырезано {j['cut_seconds']:.0f} с пауз и оговорок")
     text = (f"<b>{html.escape(j['title'])}</b>\n\n{html.escape(captions.full_caption(j))}")
@@ -566,7 +590,7 @@ async def on_photo(m: Message):
     await bot.download(m.photo[-1] if m.photo else m.document, destination=path)
     store.update(lambda d: d["jobs"][job_id].update(
         {"extra_cards": (d["jobs"][job_id].get("extra_cards") or []) + [{"word": idx, "image": path}],
-         "no_cards": False, "status": "processing"}))
+         "status": "processing"}))
     await m.answer(f"Хорошо: покажу картинку на «{html.escape(phrase)}».")
     await _process(m.chat.id, job_id, new_caption=False)
 
@@ -617,6 +641,10 @@ async def on_text(m: Message):
     words = load_or_transcribe(f["src"], f["words"])
     words = captions.remove_phrases(words, j.get("removed", []))
     e = await asyncio.to_thread(captions.parse_edit, request, words, j)
+    if e.get("fallback"):
+        log.warning("Claude не разобрал правку: %s", e["fallback"])
+        await m.answer("⚠️ Claude сейчас не ответил, разбираю правку упрощённо "
+                       f"(причина: {html.escape(e['fallback'][:200])}).")
     flags = {}
     store.update(lambda d: flags.update(edits.apply(d["jobs"][job_id], e)))
 

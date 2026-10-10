@@ -4,9 +4,11 @@
 отдельными файлами в открытый репозиторий, поэтому сервер скачивает каждый при первой просьбе
 и хранит у себя в папке данных.
 """
+import json
 import os
 import re
 import subprocess
+import urllib.parse
 import urllib.request
 
 from . import store
@@ -93,11 +95,14 @@ def _dir(kind: str) -> str:
     return d
 
 
+UA = "IconWitchFactory/1.0 (https://github.com/atarverum/content-factory)"
+
+
 def _download(urls: list[str], dst: str):
     last = None
     for url in urls:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (factory)"})
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=60) as r, open(dst, "wb") as f:
                 f.write(r.read())
             return
@@ -133,6 +138,48 @@ def effect_file(name: str) -> str | None:
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", raw, "-t", "10", "-an",
                     "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", out], check=True)
+    os.remove(raw)
+    return out
+
+
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+
+
+def _commons_search(query: str, limit: int = 8) -> list[dict]:
+    """Картинки из Wikimedia Commons (свободные лицензии) по запросу, лучшие первыми: [{"title", "thumb"}]."""
+    params = {
+        "action": "query", "format": "json", "generator": "search", "gsrnamespace": "6",
+        "gsrsearch": f"{query} filetype:bitmap", "gsrlimit": str(limit),
+        "prop": "imageinfo", "iiprop": "url|mime|size", "iiurlwidth": "1080",
+    }
+    req = urllib.request.Request(COMMONS_API + "?" + urllib.parse.urlencode(params), headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.load(r)
+    pages = sorted((data.get("query") or {}).get("pages", {}).values(), key=lambda p: p.get("index", 99))
+    out = []
+    for p in pages:
+        info = (p.get("imageinfo") or [{}])[0]
+        if info.get("mime") not in ("image/jpeg", "image/png", "image/webp"):
+            continue
+        if min(info.get("width") or 0, info.get("height") or 0) < 300:
+            continue  # значки и крошечные картинки не годятся
+        out.append({"title": p.get("title", ""), "thumb": info.get("thumburl") or info.get("url")})
+    return out
+
+
+def image_file(query: str) -> str:
+    """Картинка по запросу («black cat»): скачивается один раз и хранится в папке данных."""
+    out = os.path.join(_dir("images"), safe_name(query.lower()) + ".jpg")
+    if os.path.exists(out):
+        return out
+    found = _commons_search(query)
+    if not found:
+        raise RuntimeError(f"в фотобанке нет картинки «{query}»")
+    raw = out + ".src"
+    _download([x["thumb"] for x in found[:3]], raw)
+    from PIL import Image
+    with Image.open(raw) as im:
+        im.convert("RGB").save(out, "JPEG", quality=92)
     os.remove(raw)
     return out
 
