@@ -17,6 +17,7 @@
 #   bash install-vpn.sh hy2      добавить запасной протокол Hysteria2 (UDP 443)
 #   bash install-vpn.sh clash    файл настроек для Clash Verge Rev
 #   bash install-vpn.sh stats    кто сколько накачал, кто онлайн, куда ходили за час
+#   bash install-vpn.sh speed    скорость интернета у самого сервера
 #   bash install-vpn.sh sni САЙТ сменить сайт маскировки (self — сайт фабрики)
 set -euo pipefail
 
@@ -76,6 +77,24 @@ $1:$CADDY_PORT {
 	}
 }
 EOF
+}
+
+# Сеть сервера: BBR, большие буферы для дальнего канала Россия — Нидерланды и без «остывания»
+# соединения после паузы (иначе каждая новая страница сначала грузится медленно).
+tune_net() {
+  cat > /etc/sysctl.d/99-vpn-speed.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_notsent_lowat=16384
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_fastopen=3
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 131072 33554432
+net.ipv4.tcp_wmem=4096 65536 33554432
+EOF
+  sysctl -q --system >/dev/null 2>&1 || true
 }
 
 # Переводит VPN на 443, а Caddy прячет за ним. Если сайт после этого не открывается,
@@ -318,6 +337,34 @@ cfg = json.load(open(p))
 priv = cfg["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"]
 # routeOnly выключен: сервер сам узнаёт адрес сайта (DNS в Нидерландах, без утечек).
 sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False}
+# Российские зоны и сервисы идут мимо VPN. Список, а не geosite/geoip: на iPhone у VPN всего
+# 50 МБ памяти, полные базы стран туда не влезают (VPN падает и долго стартует).
+RU_ZONES = ["ru", "su", "xn--p1ai", "moscow", "xn--p1acf", "xn--80asehdb", "xn--c1avg", "xn--80aswg",
+            "xn--80adxhks", "xn--d1acj3b"]
+RU_SITES = """
+2gis.com 2gis.ru aeroflot.ru alfabank.ru alfabank.st auto.ru aviasales.ru avito.ru avito.st beeline.ru
+best2pay.net boxberry.ru cbr.ru cdek.ru cian.ru citilink.ru dns-shop.ru drom.ru dzen.ru gazprombank.ru
+gismeteo.ru gosuslugi.ru gov.ru hh.ru ivi.ru kinopoisk.ru lamoda.ru mail.ru max.ru megafon.ru megamarket.ru
+mironline.ru mkb.ru mos.ru mts.ru mvideo.ru mycdn.me nspk.ru ok.ru okko.tv oneme.ru open.ru ozon.ru ozone.ru
+pobeda.aero pochta.ru pochtabank.ru premier.one psbank.ru raiffeisen.ru rostelecom.ru rshb.ru rt.ru rutube.ru
+rzd.ru s7.ru sber.ru sberbank.ru sbrf.ru smotrim.ru sovcombank.ru tbank.ru tele2.ru tinkoff.ru userapi.com
+vk-cdn.net vk.com vk.me vk.ru vkuser.net vkuservideo.net vtb.ru wb.ru wbbasket.ru wildberries.ru wink.ru
+ya.ru yandex.com yandex.net yandex.ru yandexcloud.net yastatic.net yoomoney.ru yota.ru okcdn.ru
+ip.mail.ru ipv4-internet.yandex.net ipv6-internet.yandex.net
+apple.com icloud.com icloud-content.com mzstatic.com cdn-apple.com aaplimg.com apple-dns.net itunes.com
+me.com mac.com apple-cloudkit.com apple-mapkit.com appleid.com
+microsoft.com windows.com windowsupdate.com live.com office.com office.net outlook.com skype.com
+""".split()
+# Через VPN даже если домен попал в список выше (а также Telegram по адресам: приложение ходит без DNS).
+PROXY_SITES = ["copilot.microsoft.com", "gemini.gstatic.com"]
+TELEGRAM_IP = ["91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22", "91.108.16.0/22", "91.108.20.0/22",
+               "91.108.56.0/22", "91.105.192.0/23", "149.154.160.0/20", "185.76.151.0/24",
+               "95.161.64.0/20", "2001:67c:4e8::/48", "2001:b28:f23c::/48", "2001:b28:f23d::/48",
+               "2001:b28:f23f::/48", "2a0a:f280::/32"]
+PRIVATE_IP = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16",
+              "100.64.0.0/10", "fc00::/7", "fe80::/10"]
+YANDEX_DNS = ["77.88.8.8", "77.88.8.1"]
+ru_domains = ["domain:" + d for d in RU_ZONES + RU_SITES]
 for c in cfg["inbounds"][0]["settings"]["clients"]:
     uid, name = c["id"], c.get("email", "VPN")
     token = hashlib.sha256((uid + priv).encode()).hexdigest()[:24]
@@ -326,38 +373,39 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
                 "settings": {"vnext": [{"address": ip, "port": port,
                     "users": [{"id": uid, "encryption": "none", "flow": ""}]}]},
                 "streamSettings": {"network": "xhttp", "security": "reality",
-                    "xhttpSettings": {"path": "/" + path, "mode": "auto"},
+                    # Трафик раскладывается на несколько TCP-соединений и они регулярно обновляются:
+                    # если провайдер придушит одно, остальные тянут, а придушенное скоро сменится.
+                    "xhttpSettings": {"path": "/" + path, "mode": "auto",
+                        "extra": {"xmux": {"maxConcurrency": "4-8", "cMaxReuseTimes": 0,
+                                           "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "600-1200"}}},
                     "realitySettings": {"serverName": sni, "fingerprint": "chrome",
-                        "publicKey": pub, "shortId": sid}}}
+                        "publicKey": pub, "shortId": sid},
+                    "sockopt": {"tcpKeepAliveIdle": 30}}}
     conf = {
         "remarks": "🇳🇱 Raido NL",
-        # Без своего DNS на iPhone VPN не стартует: запросы зацикливаются в туннеле.
-        "dns": {"servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
+        # Российские сайты узнаём у Яндекса (так они отдают ближайший сервер), остальное через Google DoH.
+        "dns": {"hosts": {"dns.google": ["8.8.8.8", "8.8.4.4"]},
+                "servers": [{"address": YANDEX_DNS[0], "domains": ru_domains, "skipFallback": True},
+                            "https://dns.google/dns-query"],
                 "queryStrategy": "UseIPv4"},
+        "policy": {"levels": {"0": {"handshake": 4, "connIdle": 300, "uplinkOnly": 1, "downlinkOnly": 1}}},
         "inbounds": [
             {"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
              "settings": {"auth": "noauth", "udp": True}, "sniffing": sniff},
             {"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http",
              "settings": {}, "sniffing": sniff}],
-        # Один вход 8443: 443 у Александра провайдер душит, а пустая проверка входов на iPhone
-        # тормозила старт (при неудачной первой проверке телефон уходил на 443). Резервом станет мост в России.
-        "outbounds": [out("vpn-8443", 8443),
+        "outbounds": [out("vpn", 8443),
                       {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
                       {"tag": "block", "protocol": "blackhole"}],
-        # Без geoip/geosite: на iPhone у VPN всего 50 МБ памяти, а эти базы съедают ~20 МБ и тормозят запуск.
         "routing": {"domainStrategy": "AsIs",
             "rules": [
-                {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
-                                         "169.254.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10", ip],
-                 "outboundTag": "direct"},
-                {"type": "field", "domain": ["domain:ru", "domain:su", "domain:xn--p1ai", "domain:moscow",
-                    "domain:yandex.net", "domain:yandex.com", "domain:yastatic.net", "domain:ya.ru",
-                    "domain:vk.com", "domain:vk.me", "domain:userapi.com", "domain:vkuser.net", "domain:mycdn.me",
-                    "domain:okcdn.ru", "domain:max.ru", "domain:wbbasket.ru", "domain:avito.st"],
-                 "outboundTag": "direct"},
+                {"type": "field", "ip": PRIVATE_IP + YANDEX_DNS + [ip], "outboundTag": "direct"},
+                {"type": "field", "domain": ["domain:" + d for d in PROXY_SITES], "outboundTag": "vpn"},
+                {"type": "field", "ip": TELEGRAM_IP, "outboundTag": "vpn"},
+                {"type": "field", "domain": ru_domains, "outboundTag": "direct"},
                 # QUIC (HTTP/3) через туннель тормозит: браузер сразу уходит на обычный HTTPS.
                 {"type": "field", "network": "udp", "port": "443", "outboundTag": "block"},
-                {"type": "field", "network": "tcp,udp", "outboundTag": "vpn-8443"}]}}
+                {"type": "field", "network": "tcp,udp", "outboundTag": "vpn"}]}}
     with open("/etc/xray-sub/" + token, "w") as f:
         json.dump(conf, f, ensure_ascii=False, indent=2)
     print(token, name)
@@ -370,6 +418,7 @@ PY
           || { cp /etc/caddy/Caddyfile.before-sub /etc/caddy/Caddyfile; die "Caddy не принял настройки, вернул как было"; }
         systemctl restart caddy
       fi
+      tune_net
       systemctl restart xray; sleep 2
       systemctl is-active -q xray || die "VPN не запустился"
       while read -r token name; do
@@ -478,12 +527,22 @@ PY
         vnstat -m 2>/dev/null | tail -n 4 || echo "  статистика появится через несколько минут"
       fi
       exit 0 ;;
+    speed)
+      # Скорость самого сервера (без VPN и без вашего провайдера): если она высокая, а у вас медленно,
+      # дело в пути от вас до сервера.
+      say "Скорость интернета у сервера (скачиваю тестовые файлы)"
+      for u in https://nbg1-speed.hetzner.com/100MB.bin https://proof.ovh.net/files/100Mb.dat; do
+        sp=$(curl -s -o /dev/null --max-time 20 -w '%{speed_download}' "$u" || echo 0)
+        python3 -c "import sys; print(f'  {sys.argv[1]:<45} {float(sys.argv[2])*8/1e6:7.0f} Мбит/с')" "${u#https://}" "$sp"
+      done
+      echo "  Ускорение сети: $(sysctl -n net.ipv4.tcp_congestion_control), без остывания: $(sysctl -n net.ipv4.tcp_slow_start_after_idle | sed 's/0/да/;s/1/нет/')"
+      exit 0 ;;
     all)
       bash "$0" sni self >/dev/null
       grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
       [ -f /etc/hysteria/vpn.env ] || bash "$0" hy2 >/dev/null
       exec bash "$0" show ;;
-    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all, auto, stats и clash)" ;;
+    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all, auto, stats, speed и clash)" ;;
   esac
 fi
 
@@ -557,11 +616,7 @@ EOF
 )
 
 say "Включаю ускорение сети (BBR)"
-cat > /etc/sysctl.d/99-vpn-speed.conf <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-sysctl -q --system || true
+tune_net
 
 systemctl enable -q xray
 move_to_443
