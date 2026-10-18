@@ -406,6 +406,81 @@ apple.com icloud.com icloud-content.com mzstatic.com cdn-apple.com aaplimg.com a
 me.com mac.com apple-cloudkit.com apple-mapkit.com appleid.com
 microsoft.com windows.com windowsupdate.com live.com office.com office.net outlook.com skype.com
 """.split()
+# Российские сервисы на адресах не в .ru (банки, магазины, госсервисы, такси, каршеринг и т.д.):
+# категория category-ru из v2fly/domain-list-community (MIT), без зарубежных зеркал и дублей.
+RU_EXTRA = """
+24h.tv 2gis.ae 2gis.am 2gis.az 2gis.by 2gis.com 2gis.com.cy 2gis.cz 2gis.ge 2gis.kg 2gis.kz 2gis.tech 2gis.tj
+2gis.uz 3ebra.net 4epenaxa.com 5post.market accesspoint.uz acmvid.com adsadvisor.io adygtelecom.com
+alefbank.com alfa.me alfabank.st algoritmika.org aodahl.com apptrackpets.com armgs.team at.ua atomyze.tech
+attachmy.com autoru.me aviasales.com avito.st avs.io bank131.com bargipsy.com beeline.tv beget.app beget.cloud
+beget.com beget.de beget.hosting beget.pro beget.tech begetcdn.cloud best2pay.net bizmrg.com
+bk6bba-resources.com boosty.to botmechanic.io bps-sberbank.by cabconnect.org callbackkiller.com carrot-mail.io
+carrotquest-mail.io carrotquest.app carrotquest.io carrottrack.app cbkiller.com cdek.shopping cdn-vk.net
+cdnvideohub.com chipcore.com chizhik.club cian.site ciciq.net cloudru.cn clstorage.net cm.expert codeseason.by
+copymonkey.app corp.express cups.online dahlmessenger.com dashly.app dashly.help dashly.io dashly.me
+dashlytrack.app datacloudmy.com dbo-dengi.online dev-my.com dev-my.games dodois.com dodois.io dodopizza.com
+dodostatic.net donationalerts.com driveawaytaxi.org drweb.com drweb.kz durovscode.com eadaily.com eadaily.info
+eadaily.net eadaily.org eaptechka.online edu22.info emias.info energotransbank.com envybox.company
+envybox.family envybox.io envybox.kg envycdp.com envycrm.com epicevents.gg esforce.com etna.ai evrasia.rest
+ewisdom.us.kg express.ms fix-price.com flocktory.com flomni.com flowwow-images.com flowwow.com fon.bet
+fon.promo foto-planeta.com full:mvideo.edna.io funpay.com gazprombank.com gazprombank.investments gerwin.io
+getsynapse.io giga.chat gismeteo.by gismeteo.com gismeteo.net gismeteo.st gogettaxi.org gorzdrav.org goup.ai
+gramotei.online greywallpass.com haicomdc.com hayya.ae hh.by hh.kz home.bank hva.im icq.com icq.im ideco.dev
+it-territory.com ivicdn.tv ixbt.com ixbt.games ixbt.market ixbt.media ixbt.pro ixbt.shop ixbt.site ixbt.video
+jivo.chat jivochat.co.in jivochat.co.za jivochat.com jivochat.com.br jivochat.com.co jivochat.com.pe
+jivochat.com.tr jivochat.de jivochat.es jivochat.ng jivosite.com jump.taxi justveryok.com kaspersky-labs.com
+kaspersky.com kaspersky.kz keyboardmen.com kinescopecdn.net kinorium.com knightspeak.com kontur-inc.com
+kontur.host koronapay.com koshelek.app lenta.com lenta.tech lovina.app magnit.com mail-carrotquest.io
+maritimebank.com mcs.st medsi.com medsi.pro megafon.com megafon.tv megamarket.tech mel.fm memealerts.com
+meteofor.com meteofor.st meteum.ai mfa.center mindbox.cloud mindbox.group mindbox.site mindbox.so
+mirabilis.com mobile-bb.com moex.com more.tv mosmetro.tech movika.com mp.world mpgw-my.com mradx.net
+mts-ws.net mvk.com my-manager-account.com my.com my.games myadx.net mycdn.me myoffice.team mytopf.com
+mytrk.link naydex.net neon.click netcraze.club netcraze.link netcraze.pro netmonet.co netschool.website
+ngenix.net odnoklasniki.by odnoklasniki.ua odnoklassniki.am odnoklassniki.by odnoklassniki.co.ee
+odnoklassniki.eu odnoklassniki.lv odnoklassniki.tj ognihome.com ok.me okko.sport okko.tv okkoapi.tv okl.lt
+okolo.app opennet.dev oskelly.co ostin.com ozon.app ozon.by ozon.com ozon.com.by ozon.com.kz ozon.dev
+ozon.express ozon.global ozon.kz ozon.li ozon.market ozon.tech ozon.tm ozon.travel ozoncamp.pro ozoncom.by
+ozonglobalevents.com ozonpartners.by ozonrocet.by ozonroket.by ozonru.co.il ozonru.com ozonru.eu ozonru.me
+ozonusercontent.com paywb.com perekrestok.com pixonic.com polza.ai popmechanic.io poudobnee.com premier.one
+priovtb.com prod-my.games prodcontest.com promodj.com pskb.com ptsecurity.com public.express pushgrow.io
+pvubank.com pz.help qiwi.com rabbitcounter.com rabota.by randomgodbot.com rbsgate.com rbsuat.com reaviz.com
+reg.cloud reg.com reso-med.com restream-media.net robotext.io rocketozon.by roistat.com rosbank-credit.com
+rostaxi.org ru.ccb.com ru.com ru.net rugpt.io ruhub.tv rustore.team rustore.tv rutube.sport rwbautomation.tech
+saas-support.com safeliner.tech sage-observability.tech sayeasy.eu sber-bank.by sber.pro sberauto.com
+sberbank-tele.com sberbank.com sbercloud.tech seclab.lat selcdn.net selectel.academy selectel.blog
+selectel.com selectel.dev selectel.info selectel.io selectel.live servercore.com servercore.live
+servicepipe.tech sfunpay.com shedevrum.ai shedevrum.com sistema-capital.com skbx.pro skillbox.pro sky.pro
+slc.tl smailru.net smartmed.pro smena.cafe smotreshka.tv sokolov.io sourcecraft.dev spasibo.digital
+spasibo.market sprut.io srv-hub.org standoff365.com static-storage.net staticmy.com support-uber.com t-bank.by
+t-finance.group t-tech.dev t-tech.team t.finance t1.cloud tak-pravilno.com tamtam.chat tarantool.io
+targetads.io tatar taxiaid.org taxiguru.org taxitax.org taxsee.com tbank-online.com tdev.by tehnodom.com
+telega.info telega.me tilda.cc tilda.ws tildaapi.com tildacdn.com tildacdn.net timeweb.cloud timeweb.com
+timeweb.tech timewebcloud.kz tinkoff-group.com tinkoff.ai tinkoffmobile.com tips.tips tochka-tech.com
+tochka.com tokenator.top trbcdn.net turbopages.org tvoyodbo.online ucoz.ae ucoz.club ucoz.co ucoz.co.il
+ucoz.co.uk ucoz.com ucoz.com.br ucoz.com.ro ucoz.de ucoz.es ucoz.fr ucoz.hu ucoz.kz ucoz.lv ucoz.md ucoz.net
+ucoz.org ucoz.pl ucoz.site ucoz.ua ucozmail.com ucozmedia.com ucoztemplates.com ukit.ai ukit.com ukit.group
+ukit.me uma.media umschool.net uni.rest unidraw.io unirest.tech userapi.com usocial.pro vimu.tv viqeo.tv
+viqeotv.com vk-apps.com vk-cdn.me vk-cdn.net vk-portal.net vk.cc vk.com vk.company vk.design vk.kz vk.link
+vk.me vk.team vkcache.com vkcdnservice.com vkclips.app vkcloud-static.kz vkcloud.kz vkcs.cloud vkgo.app
+vklive.app vkmessenger.app vkmessenger.com vkontakte.com vkpay.app vkpay.com vkpay.io vkplay.live vkuser.net
+vkuseraudio.com vkuseraudio.net vkuserlive.com vkuserlive.net vkuservideo.com vkuservideo.net vkworkspace.kz
+vmailru.net volganet.net vscale.blog vscale.io vtb-direct.com vtb.com vtbglobalperspectives.com
+warehouse.domains wb.am wb.kg wb.kz wbautomation.tech wbcontent.net wbr.by wbstatic.net wbwh.tech webvisor.com
+webvisor.org whitesaas.com whoosh.bike wibes.com wildberries.am wildberries.by wildberries.co.il
+wildberries.es wildberries.eu wildberries.ge wildberries.kg wildberries.kz wildberries.lt wildberries.tj
+wildberries.tm wildberries.uz wink.am x5.ai x5.com x5.digital x5.group x5.media x5.team x5.tech x5static.net
+xlnk.ms xn--80aqcf7a6do.com xn--90ab.com xn--90aifd0az.shop xn--b1aechhj6bof8g5a.site xn--d1abkf4ap.fun
+xn--e1adjldbbpv.xn--90ais xn--h1ao.site ya.cc yadi.sk yads.tech yandex yandex-ad.cn yandex-bank.net
+yandex-team.com yandex.aero yandex.asia yandex.az yandex.by yandex.cloud yandex.co.il yandex.com yandex.com.am
+yandex.com.ge yandex.com.tr yandex.com.ua yandex.de yandex.ee yandex.eu yandex.fi yandex.fr yandex.it
+yandex.jobs yandex.kg yandex.kz yandex.lt yandex.lv yandex.market yandex.md yandex.mobi yandex.net yandex.org
+yandex.pl yandex.pro yandex.st yandex.sx yandex.taxi yandex.tj yandex.tm yandex.tr yandex.travel yandex.ua
+yandex.uz yandexadexchange.net yandexcloud.net yandexcom.net yandexdataschool.com yandexgo.com
+yandexmetrica.com yandexwebcache.net yandexwebcache.org yango-ads.com yango-b2b.com yango-team.com
+yango-tech.com yango.africa yango.ao yango.bh yango.co.il yango.com yango.fi yango.qa yango.taxi yango.tech
+yangofellowship.com yaplakal.com yastat.net yastatic.net yclients.com ydb.tech yndx.net youla.io yourgood.app
+zvuk-b2b.com zvuk.com
+""".split()
 # Через VPN даже если домен попал в список выше (а также Telegram по адресам: приложение ходит без DNS).
 PROXY_SITES = ["copilot.microsoft.com", "gemini.gstatic.com"]
 TELEGRAM_IP = ["91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22", "91.108.16.0/22", "91.108.20.0/22",
@@ -415,7 +490,7 @@ TELEGRAM_IP = ["91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22", "91.108.16.0/
 PRIVATE_IP = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16",
               "100.64.0.0/10", "fc00::/7", "fe80::/10"]
 YANDEX_DNS = ["77.88.8.8", "77.88.8.1"]
-ru_domains = ["domain:" + d for d in RU_ZONES + RU_SITES]
+ru_domains = [d if d.startswith("full:") else "domain:" + d for d in dict.fromkeys(RU_ZONES + RU_SITES + RU_EXTRA)]
 for c in cfg["inbounds"][0]["settings"]["clients"]:
     uid, name = c["id"], c.get("email", "VPN")
     token = hashlib.sha256((uid + priv).encode()).hexdigest()[:24]
