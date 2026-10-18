@@ -18,6 +18,8 @@
 #   bash install-vpn.sh clash    файл настроек для Clash Verge Rev
 #   bash install-vpn.sh stats    кто сколько накачал, кто онлайн, куда ходили за час
 #   bash install-vpn.sh speed    скорость интернета у самого сервера
+#   bash install-vpn.sh addnode FI  подключить второй сервер к подписке (см. vpn/node.sh)
+#   bash install-vpn.sh delnode FI  убрать второй сервер из подписки
 #   bash install-vpn.sh sni САЙТ сменить сайт маскировки (self — сайт фабрики)
 set -euo pipefail
 
@@ -330,11 +332,17 @@ PY
       xray run -test -config "$CFG" >/dev/null || die "Xray не принял настройки"
       DOMAIN="${IP//./-}.sslip.io"
       mkdir -p /etc/xray-sub
-      python3 - "$CFG" "$IP" "$SNI" "$PUB" "$SID" "$XPATH" <<'PY' > /etc/xray-sub/.list
+      python3 - "$CFG" "$IP" "$SNI" "$PUB" "$SID" "$XPATH" "$DIR/nodes" <<'PY' > /etc/xray-sub/.list
 import json, sys, hashlib
-p, ip, sni, pub, sid, path = sys.argv[1:]
+import glob, os
+p, ip, sni, pub, sid, path, nodes_dir = sys.argv[1:]
 cfg = json.load(open(p))
 priv = cfg["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"]
+# Серверы подписки: главный (Нидерланды) и подключённые командой addnode (имя файла = код страны).
+FLAGS = {"FI": "🇫🇮", "RU": "🇷🇺", "DE": "🇩🇪", "SE": "🇸🇪", "EE": "🇪🇪", "LV": "🇱🇻", "NL": "🇳🇱"}
+servers = [dict(code="NL", ip=ip, port=8443, sni=sni, pub=pub, sid=sid, path=path)]
+for f in sorted(glob.glob(os.path.join(nodes_dir, "*.json"))):
+    servers.append(dict(json.load(open(f)), code=os.path.basename(f)[:-5]))
 # routeOnly выключен: сервер сам узнаёт адрес сайта (DNS в Нидерландах, без утечек).
 sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False}
 # Российские зоны и сервисы идут мимо VPN. Список, а не geosite/geoip: на iPhone у VPN всего
@@ -368,46 +376,65 @@ ru_domains = ["domain:" + d for d in RU_ZONES + RU_SITES]
 for c in cfg["inbounds"][0]["settings"]["clients"]:
     uid, name = c["id"], c.get("email", "VPN")
     token = hashlib.sha256((uid + priv).encode()).hexdigest()[:24]
-    def out(tag, port):
-        return {"tag": tag, "protocol": "vless",
-                "settings": {"vnext": [{"address": ip, "port": port,
+    def out(srv):
+        return {"tag": "vpn-" + srv["code"].lower(), "protocol": "vless",
+                "settings": {"vnext": [{"address": srv["ip"], "port": int(srv["port"]),
                     "users": [{"id": uid, "encryption": "none", "flow": ""}]}]},
                 "streamSettings": {"network": "xhttp", "security": "reality",
                     # Трафик раскладывается на несколько TCP-соединений и они регулярно обновляются:
                     # если провайдер придушит одно, остальные тянут, а придушенное скоро сменится.
-                    "xhttpSettings": {"path": "/" + path, "mode": "auto",
+                    "xhttpSettings": {"path": "/" + srv["path"], "mode": "auto",
                         "extra": {"xmux": {"maxConcurrency": "4-8", "cMaxReuseTimes": 0,
                                            "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "600-1200"}}},
-                    "realitySettings": {"serverName": sni, "fingerprint": "chrome",
-                        "publicKey": pub, "shortId": sid},
+                    "realitySettings": {"serverName": srv["sni"], "fingerprint": "chrome",
+                        "publicKey": srv["pub"], "shortId": srv["sid"]},
                     "sockopt": {"tcpKeepAliveIdle": 30}}}
-    conf = {
-        "remarks": "🇳🇱 Raido NL",
-        # Российские сайты узнаём у Яндекса (так они отдают ближайший сервер), остальное через Google DoH.
-        "dns": {"hosts": {"dns.google": ["8.8.8.8", "8.8.4.4"]},
-                "servers": [{"address": YANDEX_DNS[0], "domains": ru_domains, "skipFallback": True},
-                            "https://dns.google/dns-query"],
-                "queryStrategy": "UseIPv4"},
-        "policy": {"levels": {"0": {"handshake": 4, "connIdle": 300, "uplinkOnly": 1, "downlinkOnly": 1}}},
-        "inbounds": [
-            {"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
-             "settings": {"auth": "noauth", "udp": True}, "sniffing": sniff},
-            {"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http",
-             "settings": {}, "sniffing": sniff}],
-        "outbounds": [out("vpn", 8443),
-                      {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
-                      {"tag": "block", "protocol": "blackhole"}],
-        "routing": {"domainStrategy": "AsIs",
-            "rules": [
-                {"type": "field", "ip": PRIVATE_IP + YANDEX_DNS + [ip], "outboundTag": "direct"},
-                {"type": "field", "domain": ["domain:" + d for d in PROXY_SITES], "outboundTag": "vpn"},
-                {"type": "field", "ip": TELEGRAM_IP, "outboundTag": "vpn"},
-                {"type": "field", "domain": ru_domains, "outboundTag": "direct"},
-                # QUIC (HTTP/3) через туннель тормозит: браузер сразу уходит на обычный HTTPS.
-                {"type": "field", "network": "udp", "port": "443", "outboundTag": "block"},
-                {"type": "field", "network": "tcp,udp", "outboundTag": "vpn"}]}}
+    def conf(remarks, chosen):
+        outs = [out(x) for x in chosen]
+        tags = [o["tag"] for o in outs]
+        # Несколько серверов: Happ раз в минуту меряет каждый и идёт через самый быстрый.
+        # Пока замеров нет (первые секунды) или все «не ответили», идёт через первый (Нидерланды).
+        final = {"balancerTag": "auto"} if len(outs) > 1 else {"outboundTag": tags[0]}
+        c = {
+            "remarks": remarks,
+            # Российские сайты узнаём у Яндекса (так они отдают ближайший сервер), остальное через Google DoH.
+            "dns": {"hosts": {"dns.google": ["8.8.8.8", "8.8.4.4"]},
+                    "servers": [{"address": YANDEX_DNS[0], "domains": ru_domains, "skipFallback": True},
+                                "https://dns.google/dns-query"],
+                    "queryStrategy": "UseIPv4"},
+            "policy": {"levels": {"0": {"handshake": 4, "connIdle": 300, "uplinkOnly": 1, "downlinkOnly": 1}}},
+            "inbounds": [
+                {"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+                 "settings": {"auth": "noauth", "udp": True}, "sniffing": sniff},
+                {"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http",
+                 "settings": {}, "sniffing": sniff}],
+            "outbounds": outs + [
+                {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
+                {"tag": "block", "protocol": "blackhole"}],
+            "routing": {"domainStrategy": "AsIs",
+                "rules": [
+                    {"type": "field", "ip": PRIVATE_IP + YANDEX_DNS + [x["ip"] for x in servers],
+                     "outboundTag": "direct"},
+                    dict({"type": "field", "domain": ["domain:" + d for d in PROXY_SITES]}, **final),
+                    dict({"type": "field", "ip": TELEGRAM_IP}, **final),
+                    {"type": "field", "domain": ru_domains, "outboundTag": "direct"},
+                    # QUIC (HTTP/3) через туннель тормозит: браузер сразу уходит на обычный HTTPS.
+                    {"type": "field", "network": "udp", "port": "443", "outboundTag": "block"},
+                    dict({"type": "field", "network": "tcp,udp"}, **final)]}}
+        if len(outs) > 1:
+            c["observatory"] = {"subjectSelector": ["vpn-"], "probeURL": "https://www.google.com/generate_204",
+                                "probeInterval": "1m", "enableConcurrency": True}
+            c["routing"]["balancers"] = [{"tag": "auto", "selector": ["vpn-"],
+                                          "strategy": {"type": "leastPing"}, "fallbackTag": tags[0]}]
+        return c
+    name_of = lambda x: f'{FLAGS.get(x["code"], "🌐")} Raido {x["code"]}'
+    if len(servers) == 1:
+        body = conf(name_of(servers[0]), servers)
+    else:
+        # Список в Happ: «самый быстрый» сверху, ниже каждый сервер отдельно.
+        body = [conf("⚡ Raido Auto", servers)] + [conf(name_of(x), [x]) for x in servers]
     with open("/etc/xray-sub/" + token, "w") as f:
-        json.dump(conf, f, ensure_ascii=False, indent=2)
+        json.dump(body, f, ensure_ascii=False, indent=2)
     print(token, name)
 PY
       chmod 755 /etc/xray-sub; chmod 644 /etc/xray-sub/*
@@ -527,6 +554,26 @@ PY
         vnstat -m 2>/dev/null | tail -n 4 || echo "  статистика появится через несколько минут"
       fi
       exit 0 ;;
+    export)
+      # Список людей для второго сервера (см. vpn/node.sh). Только идентификаторы ключей и имена.
+      python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["inbounds"][0]["settings"]["clients"]; print(json.dumps({"clients":[{"id":x["id"],"email":x.get("email","VPN")} for x in c]}))' "$CFG"
+      exit 0 ;;
+    addnode)
+      # Подключает второй сервер к подписке: параметры приходят из vpn/node.sh по трубе.
+      CODE=$(echo "${2:-}" | tr '[:lower:]' '[:upper:]')
+      [[ "$CODE" =~ ^[A-Z]{2}$ ]] || die "укажите код страны из двух букв: addnode FI"
+      mkdir -p "$DIR/nodes"
+      python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert all(d.get(k) for k in ("ip", "port", "sni", "pub", "sid", "path"))
+json.dump(d, open(sys.argv[1], "w"))' "$DIR/nodes/$CODE.json" || die "не получил параметры второго сервера (вторая часть команды)"
+      say "Сервер $CODE добавлен в подписку"
+      exec bash "$0" auto ;;
+    delnode)
+      CODE=$(echo "${2:-}" | tr '[:lower:]' '[:upper:]')
+      rm -f "$DIR/nodes/${CODE:?укажите код страны}.json"
+      exec bash "$0" auto ;;
     speed)
       # Скорость самого сервера (без VPN и без вашего провайдера): если она высокая, а у вас медленно,
       # дело в пути от вас до сервера.
@@ -542,7 +589,7 @@ PY
       grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
       [ -f /etc/hysteria/vpn.env ] || bash "$0" hy2 >/dev/null
       exec bash "$0" show ;;
-    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all, auto, stats, speed и clash)" ;;
+    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all, auto, stats, speed, export, addnode, delnode и clash)" ;;
   esac
 fi
 
