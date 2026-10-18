@@ -18,6 +18,8 @@
 #   bash install-vpn.sh clash    файл настроек для Clash Verge Rev
 #   bash install-vpn.sh stats    кто сколько накачал, кто онлайн, куда ходили за час
 #   bash install-vpn.sh speed    скорость интернета у самого сервера
+#   bash install-vpn.sh direct САЙТ  пускать сайт мимо VPN (vpn САЙТ — через VPN, unlist САЙТ — убрать)
+#   bash install-vpn.sh lists    показать свои списки
 #   bash install-vpn.sh addnode FI  подключить второй сервер к подписке (см. vpn/node.sh)
 #   bash install-vpn.sh delnode FI  убрать второй сервер из подписки
 #   bash install-vpn.sh sni САЙТ сменить сайт маскировки (self — сайт фабрики)
@@ -314,6 +316,7 @@ EOF
       # Подписка для Happ (JSON): вход XHTTP 8443, русские сайты напрямую. Обновляется в Happ сама,
       # так что новые входы (например, мост в России) появятся у всех без переустановки.
       [ "$PORT" = 443 ] || die "сначала: bash install-vpn.sh move443"
+      if [ -z "${SUB_ONLY:-}" ]; then
       grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
       # shellcheck disable=SC1090
       . "$STATE"
@@ -355,12 +358,21 @@ WantedBy=timers.target
 EOF
       systemctl daemon-reload
       systemctl enable -q --now xray-nightly.timer
+      fi
       DOMAIN="${IP//./-}.sslip.io"
       mkdir -p /etc/xray-sub
-      python3 - "$CFG" "$IP" "$SNI" "$PUB" "$SID" "$XPATH" "$DIR/nodes" <<'PY' > /etc/xray-sub/.list
+      touch "$DIR/direct.list" "$DIR/vpn.list"
+      python3 - "$CFG" "$IP" "$SNI" "$PUB" "$SID" "$XPATH" "$DIR/nodes" "$DIR" <<'PY' > /etc/xray-sub/.list
 import json, sys, hashlib
 import glob, os
-p, ip, sni, pub, sid, path, nodes_dir = sys.argv[1:]
+p, ip, sni, pub, sid, path, nodes_dir, lists_dir = sys.argv[1:]
+# Свои списки (команды direct / vpn): по одному сайту в строке.
+def user_list(name):
+    try:
+        return [l.strip() for l in open(os.path.join(lists_dir, name)) if l.strip() and not l.startswith("#")]
+    except OSError:
+        return []
+USER_DIRECT, USER_VPN = user_list("direct.list"), user_list("vpn.list")
 cfg = json.load(open(p))
 priv = cfg["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"]
 # Серверы подписки: главный (Нидерланды) и подключённые командой addnode (имя файла = код страны).
@@ -443,6 +455,9 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
                 "rules": [
                     {"type": "field", "ip": PRIVATE_IP + YANDEX_DNS + [x["ip"] for x in servers],
                      "outboundTag": "direct"},
+                    *([dict({"type": "field", "domain": ["domain:" + d for d in USER_VPN]}, **final)] if USER_VPN else []),
+                    *([{"type": "field", "domain": ["domain:" + d for d in USER_DIRECT], "outboundTag": "direct"}]
+                      if USER_DIRECT else []),
                     dict({"type": "field", "domain": ["domain:" + d for d in PROXY_SITES]}, **final),
                     dict({"type": "field", "ip": TELEGRAM_IP}, **final),
                     {"type": "field", "domain": ru_domains, "outboundTag": "direct"},
@@ -466,6 +481,10 @@ for c in cfg["inbounds"][0]["settings"]["clients"]:
     print(token, name)
 PY
       chmod 755 /etc/xray-sub; chmod 644 /etc/xray-sub/*
+      if [ -n "${SUB_ONLY:-}" ]; then
+        say "Подписка обновлена. В Happ нажмите «Обновить» (стрелка по кругу) или подождите до часа."
+        exit 0
+      fi
       cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.before-sub
       write_caddyfile "$DOMAIN"
       if ! cmp -s /etc/caddy/Caddyfile /etc/caddy/Caddyfile.before-sub; then
@@ -602,6 +621,37 @@ json.dump(d, open(sys.argv[1], "w"))' "$DIR/nodes/$CODE.json" || die "не по�
       CODE=$(echo "${2:-}" | tr '[:lower:]' '[:upper:]')
       rm -f "$DIR/nodes/${CODE:?укажите код страны}.json"
       exec bash "$0" auto ;;
+    direct|vpn|unlist)
+      # Свои правила: «direct сайт» — мимо VPN, «vpn сайт» — через VPN, «unlist сайт» — убрать из списков.
+      # Сайт пишется как угодно (https://www.site.com/путь → site.com), поддомены входят автоматически.
+      [ $# -ge 2 ] || die "укажите сайт: bash install-vpn.sh $1 example.com"
+      touch "$DIR/direct.list" "$DIR/vpn.list"
+      python3 - "$DIR" "$@" <<'PY'
+import os, re, sys
+d, cmd, sites = sys.argv[1], sys.argv[2], sys.argv[3:]
+def clean(x):
+    x = re.sub(r"^[a-z]+://", "", x.strip().lower()).split("/")[0].split(":")[0]
+    x = re.sub(r"^www\.", "", x)
+    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z0-9-]+", x.encode("idna").decode()):
+        sys.exit(f"не похоже на сайт: {x}")
+    return x.encode("idna").decode()
+sites = [clean(x) for x in sites]
+lists = {n: [l.strip() for l in open(os.path.join(d, n + ".list")) if l.strip()] for n in ("direct", "vpn")}
+for n in lists:
+    lists[n] = [x for x in lists[n] if x not in sites]
+if cmd != "unlist":
+    lists[cmd] += sites
+for n, items in lists.items():
+    open(os.path.join(d, n + ".list"), "w").write("".join(x + "\n" for x in items))
+where = {"direct": "мимо VPN", "vpn": "через VPN", "unlist": "по умолчанию"}[cmd]
+print(f"  {', '.join(sites)}: теперь {where}")
+PY
+      SUB_ONLY=1 exec bash "$0" auto ;;
+    lists)
+      say "Свои правила (кроме встроенных: российские сайты мимо VPN, остальное через VPN)"
+      echo "  Мимо VPN: $(tr '\n' ' ' < "$DIR/direct.list" 2>/dev/null)"
+      echo "  Через VPN: $(tr '\n' ' ' < "$DIR/vpn.list" 2>/dev/null)"
+      exit 0 ;;
     speed)
       # Скорость самого сервера (без VPN и без вашего провайдера): если она высокая, а у вас медленно,
       # дело в пути от вас до сервера.
@@ -617,7 +667,7 @@ json.dump(d, open(sys.argv[1], "w"))' "$DIR/nodes/$CODE.json" || die "не по�
       grep -q '"tag": "xhttp"' "$CFG" || bash "$0" xhttp >/dev/null
       [ -f /etc/hysteria/vpn.env ] || bash "$0" hy2 >/dev/null
       exec bash "$0" show ;;
-    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all, auto, stats, speed, export, addnode, delnode и clash)" ;;
+    *) die "неизвестная команда: $1 (есть show, add, move443, sni, xhttp, hy2, all, auto, stats, speed, direct, vpn, unlist, lists, export, addnode, delnode и clash)" ;;
   esac
 fi
 
