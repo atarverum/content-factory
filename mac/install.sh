@@ -17,7 +17,16 @@ fi
 [ -x /usr/local/bin/brew ] && eval "$(/usr/local/bin/brew shellenv)"
 
 say "Ставлю программы для видео (ffmpeg, python, node)"
-brew install ffmpeg python@3.12 node git >/dev/null
+export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+for pkg in ffmpeg python@3.12 node git; do
+  if brew list --versions "$pkg" >/dev/null 2>&1; then
+    echo "$pkg уже стоит"
+  elif brew install "$pkg"; then
+    echo "$pkg поставлен"
+  else
+    echo "Не получилось поставить $pkg. Пришлите Claude снимок экрана с текстом выше."; exit 1
+  fi
+done
 
 APP="$HOME/.content-factory"
 if [ -d "$APP/.git" ]; then
