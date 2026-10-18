@@ -327,9 +327,34 @@ ib["streamSettings"]["network"] = "xhttp"
 ib["streamSettings"]["xhttpSettings"] = {"path": "/" + path, "mode": "auto"}
 for c in ib["settings"]["clients"]:
     c["flow"] = ""
+# Соединения, которые телефон бросил без «до свидания» (уехал в метро, сменил сеть), Xray 26.x
+# держит вечно: память и сокеты копятся, VPN со временем тупит. Проверяем живость каждые 30 с
+# и закрываем молчащие через 15 с, а не через часы.
+for x in cfg["inbounds"]:
+    if x.get("protocol") == "vless":
+        x["streamSettings"]["sockopt"] = {"tcpKeepAliveIdle": 30, "tcpKeepAliveInterval": 10,
+                                          "tcpUserTimeout": 15000}
 json.dump(cfg, open(p, "w"), indent=2)
 PY
       xray run -test -config "$CFG" >/dev/null || die "Xray не принял настройки"
+      # Подстраховка от той же утечки: ночью (05:00 по Москве) VPN перезапускается за пару секунд.
+      cat > /etc/systemd/system/xray-nightly.service <<'EOF'
+[Unit]
+Description=Ночной перезапуск VPN
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart xray
+EOF
+      cat > /etc/systemd/system/xray-nightly.timer <<'EOF'
+[Unit]
+Description=Ночной перезапуск VPN в 05:00 по Москве
+[Timer]
+OnCalendar=*-*-* 02:00:00 UTC
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl daemon-reload
+      systemctl enable -q --now xray-nightly.timer
       DOMAIN="${IP//./-}.sslip.io"
       mkdir -p /etc/xray-sub
       python3 - "$CFG" "$IP" "$SNI" "$PUB" "$SID" "$XPATH" "$DIR/nodes" <<'PY' > /etc/xray-sub/.list
@@ -376,24 +401,27 @@ ru_domains = ["domain:" + d for d in RU_ZONES + RU_SITES]
 for c in cfg["inbounds"][0]["settings"]["clients"]:
     uid, name = c["id"], c.get("email", "VPN")
     token = hashlib.sha256((uid + priv).encode()).hexdigest()[:24]
-    def out(srv):
-        return {"tag": "vpn-" + srv["code"].lower(), "protocol": "vless",
+    # Два режима на каждый сервер. «Поток» (auto) быстрее; «пакеты» (packet-up) шлют данные
+    # множеством коротких запросов, как обычный сайт: их труднее заметить и придушить.
+    def out(srv, mode="auto"):
+        tag = "vpn-" + srv["code"].lower() + ("-p" if mode == "packet-up" else "")
+        return {"tag": tag, "protocol": "vless",
                 "settings": {"vnext": [{"address": srv["ip"], "port": int(srv["port"]),
                     "users": [{"id": uid, "encryption": "none", "flow": ""}]}]},
                 "streamSettings": {"network": "xhttp", "security": "reality",
                     # Трафик раскладывается на несколько TCP-соединений и они регулярно обновляются:
                     # если провайдер придушит одно, остальные тянут, а придушенное скоро сменится.
-                    "xhttpSettings": {"path": "/" + srv["path"], "mode": "auto",
+                    "xhttpSettings": {"path": "/" + srv["path"], "mode": mode,
                         "extra": {"xmux": {"maxConcurrency": "4-8", "cMaxReuseTimes": 0,
                                            "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "600-1200"}}},
                     "realitySettings": {"serverName": srv["sni"], "fingerprint": "chrome",
                         "publicKey": srv["pub"], "shortId": srv["sid"]},
                     "sockopt": {"tcpKeepAliveIdle": 30}}}
     def conf(remarks, chosen):
-        outs = [out(x) for x in chosen]
+        outs = [out(x) for x in chosen] + [out(x, "packet-up") for x in chosen]
         tags = [o["tag"] for o in outs]
-        # Несколько серверов: Happ раз в минуту меряет каждый и идёт через самый быстрый.
-        # Пока замеров нет (первые секунды) или все «не ответили», идёт через первый (Нидерланды).
+        # Happ раз в минуту меряет каждый вход и идёт через самый быстрый из живых. Пока замеров
+        # нет (первые секунды) или все «не ответили», идёт через первый (Нидерланды, поток).
         final = {"balancerTag": "auto"} if len(outs) > 1 else {"outboundTag": tags[0]}
         c = {
             "remarks": remarks,
