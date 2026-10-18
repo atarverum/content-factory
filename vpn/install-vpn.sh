@@ -399,6 +399,9 @@ ip.mail.ru ipv4-internet.yandex.net ipv6-internet.yandex.net
 ozon.com ozonusercontent.com wbstatic.net wbcontent.net yandex.cloud yandex.by yandex.kz ya.cc
 vk.company vk-portal.net vkuseraudio.net vkuserlive.net vk.cc mradx.net emias.info chizhik.club
 aviasales.com sberbank.com
+sber.ru sberbank.ru sbrf.ru sberdevices.ru sbermarket.ru sberid.ru tinkoff.com tcsbank.ru cdn-tinkoff.ru
+belkacar.ru delimobil.ru citydrive.ru citymobil.ru yango.com yango.tech go.yandex
+qrator.net ngenix.net selcdn.net ddos-guard.net stormwall.pro cloudpayments.ru
 apple.com icloud.com icloud-content.com mzstatic.com cdn-apple.com aaplimg.com apple-dns.net itunes.com
 me.com mac.com apple-cloudkit.com apple-mapkit.com appleid.com
 microsoft.com windows.com windowsupdate.com live.com office.com office.net outlook.com skype.com
