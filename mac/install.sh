@@ -42,8 +42,13 @@ PY="$(brew --prefix python@3.12)/bin/python3.12"
 [ -x "$APP/venv/bin/python" ] || "$PY" -m venv "$APP/venv"
 "$APP/venv/bin/pip" install -q --upgrade pip
 "$APP/venv/bin/pip" install -q "faster-whisper>=1.0" "Pillow>=10"
-"$APP/venv/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')" \
-  && echo "модель распознавания скачана"
+if [ -f "$HOME/Movies/whisper-small/model.bin" ]; then
+  echo "модель распознавания уже скачана (Фильмы → whisper-small)"
+else
+  echo "качаю модель распознавания (около 500 МБ, может занять время)"
+  "$APP/venv/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')" \
+    && echo "модель распознавания скачана"
+fi
 
 say "Ставлю сборщик черновиков CapCut"
 npm install -g -s capcut-cli@0.29 >/dev/null

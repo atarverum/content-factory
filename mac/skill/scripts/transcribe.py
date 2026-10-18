@@ -11,7 +11,9 @@ import sys
 def transcribe(video: str) -> list[dict]:
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(os.environ.get("WHISPER_MODEL", "small"), device="cpu", compute_type="int8")
+    local = os.path.expanduser("~/Movies/whisper-small")
+    default = local if os.path.isfile(os.path.join(local, "model.bin")) else "small"
+    model = WhisperModel(os.environ.get("WHISPER_MODEL", default), device="cpu", compute_type="int8")
     segments, _ = model.transcribe(video, language="ru", word_timestamps=True, vad_filter=True,
                                    initial_prompt="Лунные сутки, руны, расклад, Полина, ведьмы, Блаватская, таро.")
     words = []
