@@ -396,6 +396,9 @@ rzd.ru s7.ru sber.ru sberbank.ru sbrf.ru smotrim.ru sovcombank.ru tbank.ru tele2
 vk-cdn.net vk.com vk.me vk.ru vkuser.net vkuservideo.net vtb.ru wb.ru wbbasket.ru wildberries.ru wink.ru
 ya.ru yandex.com yandex.net yandex.ru yandexcloud.net yastatic.net yoomoney.ru yota.ru okcdn.ru
 ip.mail.ru ipv4-internet.yandex.net ipv6-internet.yandex.net
+ozon.com ozonusercontent.com wbstatic.net wbcontent.net yandex.cloud yandex.by yandex.kz ya.cc
+vk.company vk-portal.net vkuseraudio.net vkuserlive.net vk.cc mradx.net emias.info chizhik.club
+aviasales.com sberbank.com
 apple.com icloud.com icloud-content.com mzstatic.com cdn-apple.com aaplimg.com apple-dns.net itunes.com
 me.com mac.com apple-cloudkit.com apple-mapkit.com appleid.com
 microsoft.com windows.com windowsupdate.com live.com office.com office.net outlook.com skype.com
